@@ -39,12 +39,24 @@ export class ClaudeSDKBridge extends EventEmitter {
    */
   async query(params: ClaudeQueryParams): Promise<ClaudeQueryResult> {
     const args = this.buildArgs(params);
+    const queryStartTime = Date.now();
+
+    logger.log(
+      `Starting query: session=${params.sessionId || 'new'}, mode=${params.mode}, prompt="${params.prompt.slice(0, 50)}..."`
+    );
+    logger.log(`Spawning claude with args: ${args.join(' ').slice(0, 100)}...`);
 
     this.process = spawn('claude', args, {
       cwd: params.workingDir || process.cwd(),
       env: { ...process.env },
       stdio: ['pipe', 'pipe', 'pipe'],
     });
+
+    // Close stdin immediately to signal EOF - prevents Claude CLI from waiting for more input
+    this.process.stdin?.end();
+
+    const pid = this.process.pid;
+    logger.log(`Claude process spawned, pid=${pid}`);
 
     let capturedSessionId = params.sessionId || '';
     let isError = false;
@@ -56,7 +68,28 @@ export class ClaudeSDKBridge extends EventEmitter {
         logger.debug(`[stdout] ${line.slice(0, 200)}`);
         try {
           const event = JSON.parse(line) as SDKEvent;
-          logger.debug(`[event] type=${event.type}`);
+
+          // Log events at info level for better visibility
+          if (event.type === 'stream_event') {
+            const streamEvent = event.event;
+            if (
+              streamEvent.type === 'content_block_start' &&
+              streamEvent.content_block?.type === 'tool_use'
+            ) {
+              logger.log(`Event: content_block_start (tool: ${streamEvent.content_block.name})`);
+            } else if (streamEvent.type === 'content_block_stop') {
+              logger.log(`Event: content_block_stop`);
+            }
+            // Don't log every delta to avoid spam
+          } else if (event.type === 'result') {
+            const elapsed = ((Date.now() - queryStartTime) / 1000).toFixed(1);
+            logger.log(`Event: result, session=${event.session_id}, elapsed=${elapsed}s`);
+          } else if (event.type === 'assistant') {
+            logger.log(`Event: assistant message received`);
+          } else if (event.type === 'error') {
+            logger.log(`Event: error - ${event.error?.message || 'unknown'}`);
+          }
+
           this.emit('event', event);
 
           // Capture session ID from result or assistant message
@@ -87,6 +120,10 @@ export class ClaudeSDKBridge extends EventEmitter {
       }
 
       this.process.on('close', (code) => {
+        const elapsed = ((Date.now() - queryStartTime) / 1000).toFixed(1);
+        logger.log(
+          `Claude process exited, code=${code}, session=${capturedSessionId || 'none'}, elapsed=${elapsed}s`
+        );
         this.emit('exit', code);
         this.process = null;
 
@@ -98,6 +135,7 @@ export class ClaudeSDKBridge extends EventEmitter {
       });
 
       this.process.on('error', (error) => {
+        logger.error(`Claude process error: ${error.message}`);
         this.process = null;
         reject(error);
       });

@@ -45,11 +45,13 @@ export class OutputFormatter extends EventEmitter {
 
       if (e.type === 'content_block_start' && e.content_block.type === 'tool_use') {
         this.currentTool = e.content_block.name || 'unknown tool';
+        logger.log(`Tool started: ${this.currentTool}`);
         action = { type: 'status', text: `🔧 Using ${this.currentTool}...` };
       } else if (e.type === 'content_block_delta' && e.delta.type === 'text_delta') {
         this.textBuffer += e.delta.text;
         this.scheduleBatchSend();
       } else if (e.type === 'content_block_stop' && this.currentTool) {
+        logger.log(`Tool stopped: ${this.currentTool}`);
         this.currentTool = null;
         action = { type: 'clear_status' };
       }
@@ -70,7 +72,9 @@ export class OutputFormatter extends EventEmitter {
     }
 
     if (action) {
-      logger.debug(`[formatter] Emitting action: ${action.type}`);
+      logger.log(
+        `Emitting action: ${action.type}${action.type === 'message' ? ` (${action.text.length} chars)` : ''}`
+      );
     }
 
     return action;
@@ -97,6 +101,9 @@ export class OutputFormatter extends EventEmitter {
     const text = this.formatForTelegram(this.textBuffer);
     const options = detectInteractiveOptions(this.textBuffer);
 
+    logger.log(
+      `Flushing buffer: ${text.length} chars${options ? `, ${options.length} options` : ''}`
+    );
     this.emit('action', { type: 'message', text, options: options || undefined });
     this.textBuffer = '';
   }

@@ -61,6 +61,7 @@ export class TelegramBotService {
     'unsafe',
     'cancel',
     'querystatus',
+    'status',
     '1',
     '2',
     '3',
@@ -80,7 +81,7 @@ export class TelegramBotService {
     push: 'Push the current branch to origin',
     pr: 'Create a pull request for the current branch',
     changes: 'Show me a summary of git changes (like git diff --stat)',
-    status: "What's the current git status and working directory?",
+    gitstatus: "What's the current git status and working directory?",
   };
 
   constructor(config: TelegramBotServiceConfig) {
@@ -123,6 +124,7 @@ export class TelegramBotService {
     this.bot.command('unsafe', (ctx) => this.handleUnsafe(ctx));
     this.bot.command('cancel', (ctx) => this.handleCancel(ctx));
     this.bot.command('querystatus', (ctx) => this.handleQueryStatus(ctx));
+    this.bot.command('status', (ctx) => this.handleStatus(ctx));
 
     // Quick response commands
     for (const num of ['1', '2', '3', '4', '5', '6', '7', '8', '9']) {
@@ -218,14 +220,15 @@ Type /bothelp for all commands.
 
 *Control:*
 /cancel - Interrupt running Claude process
-/querystatus - Show current query status (elapsed time, tool)
+/status - Show session status (mode, dir, active query)
+/querystatus - Show active query status only
 
 *Shortcuts (sent as prompts):*
 /commit [msg] - Create a commit
 /push - Push current branch
 /pr [title] - Create a pull request
 /changes - Show git changes
-/status - Show git status
+/gitstatus - Ask Claude for git status
 
 *Claude Commands (forwarded directly):*
 /help, /clear, /compact, /mode, etc.
@@ -416,6 +419,57 @@ Everything else you type is sent to Claude as a prompt.
   }
 
   /**
+   * Handle /status command - shows combined session + query status
+   */
+  private async handleStatus(ctx: Context): Promise<void> {
+    const userId = ctx.from?.id;
+    if (!userId || !this.isAuthorized(userId)) {
+      await ctx.reply('Not authorized');
+      return;
+    }
+
+    const session = this.sessionManager.getSession(userId);
+    if (!session) {
+      await ctx.reply('No active session. Use /new to start one.');
+      return;
+    }
+
+    // Build session info
+    const sessionInfo = [
+      `*Session Status*`,
+      ``,
+      `📁 Working Dir: \`${session.workingDir}\``,
+      `🔐 Mode: ${session.currentMode}${session.unsafeMode ? ' (UNSAFE)' : ''}`,
+      `🆔 Claude Session: ${session.claudeSessionId ? `\`${session.claudeSessionId.slice(0, 12)}...\`` : 'None'}`,
+    ];
+
+    // Add conversation stats if available
+    if (this.conversationStore && session.claudeSessionId) {
+      const messageCount = this.conversationStore.getMessageCount(session.claudeSessionId);
+      sessionInfo.push(`💬 Messages: ${messageCount}`);
+    }
+
+    // Add active query info
+    const query = this.activeQueries.get(userId);
+    if (query) {
+      const elapsed = Math.floor((Date.now() - query.startTime.getTime()) / 1000);
+      const minutes = Math.floor(elapsed / 60);
+      const seconds = elapsed % 60;
+      const tool = query.currentTool ? `\n🔧 Using: ${query.currentTool}` : '';
+
+      sessionInfo.push(``);
+      sessionInfo.push(`*Active Query*`);
+      sessionInfo.push(`⏱ Running: ${minutes}m ${seconds}s`);
+      sessionInfo.push(`📝 "${query.prompt.slice(0, 40)}..."${tool}`);
+    } else {
+      sessionInfo.push(``);
+      sessionInfo.push(`💤 Claude is idle`);
+    }
+
+    await ctx.reply(sessionInfo.join('\n'), { parse_mode: 'Markdown' });
+  }
+
+  /**
    * Handle quick response commands (/1-/9, /y, /n)
    */
   private async handleQuickResponse(ctx: Context, response: string): Promise<void> {
@@ -519,9 +573,15 @@ Everything else you type is sent to Claude as a prompt.
     const userId = ctx.from?.id;
     if (!userId) return;
 
+    const queryStartTime = Date.now();
+    logger.log(
+      `[user:${userId}] Forwarding to Claude: "${prompt.slice(0, 50)}..." (${prompt.length} chars)`
+    );
+
     // Check if already processing a query for this user
     const existingBridge = this.activeBridges.get(userId);
     if (existingBridge?.isRunning()) {
+      logger.log(`[user:${userId}] Already has active query, rejecting`);
       await ctx.reply(
         '⏳ Claude is already working on a previous message. Use /cancel to interrupt, or wait for it to finish.'
       );
@@ -531,7 +591,12 @@ Everything else you type is sent to Claude as a prompt.
     let session = this.sessionManager.getSession(userId);
     if (!session) {
       session = this.sessionManager.createSession(userId);
+      logger.log(`[user:${userId}] Created new session`);
     }
+
+    logger.log(
+      `[user:${userId}] Session: mode=${session.currentMode}, claudeSession=${session.claudeSessionId || 'new'}`
+    );
 
     // Show typing indicator
     await ctx.replyWithChatAction('typing');
@@ -539,6 +604,7 @@ Everything else you type is sent to Claude as a prompt.
     // Create new bridge and formatter for this request
     const bridge = new ClaudeSDKBridge();
     const formatter = new OutputFormatter();
+    logger.log(`[user:${userId}] Created bridge and formatter`);
 
     this.activeBridges.set(userId, bridge);
     this.activeFormatters.set(userId, formatter);
@@ -668,7 +734,7 @@ Everything else you type is sent to Claude as a prompt.
     // Run Claude query in background - don't await to avoid blocking polling
     const runQuery = async () => {
       try {
-        logger.log('[forwardToClaude] Starting Claude query...');
+        logger.log(`[user:${userId}] Starting Claude query...`);
 
         // No timeout - let Claude work as long as needed
         // User can always /cancel if needed
@@ -679,11 +745,16 @@ Everything else you type is sent to Claude as a prompt.
           workingDir: session.workingDir,
           unsafeMode: session.unsafeMode,
         });
-        logger.log('[forwardToClaude] Claude query completed');
+
+        const elapsed = ((Date.now() - queryStartTime) / 1000).toFixed(1);
+        logger.log(
+          `[user:${userId}] Query completed in ${elapsed}s, session=${result.sessionId}, isError=${result.isError}`
+        );
 
         // Update session with Claude session ID if new
         if (!session.claudeSessionId && result.sessionId) {
           this.sessionManager.setClaudeSessionId(userId, result.sessionId);
+          logger.log(`[user:${userId}] Updated session ID to ${result.sessionId}`);
         }
 
         // Store assistant response in conversation history
@@ -697,7 +768,8 @@ Everything else you type is sent to Claude as a prompt.
           });
         }
       } catch (error) {
-        logger.error('Claude query failed:', error);
+        const elapsed = ((Date.now() - queryStartTime) / 1000).toFixed(1);
+        logger.error(`[user:${userId}] Query failed after ${elapsed}s:`, error);
         await ctx.reply(`❌ Error: ${error instanceof Error ? error.message : 'Unknown error'}`);
       } finally {
         clearInterval(statusInterval);
@@ -724,7 +796,8 @@ Everything else you type is sent to Claude as a prompt.
         { command: 'sessions', description: 'Show current session info' },
         { command: 'switch', description: 'Switch to a different session' },
         { command: 'cancel', description: 'Interrupt running operation' },
-        { command: 'querystatus', description: 'Show current query status' },
+        { command: 'status', description: 'Show session status' },
+        { command: 'querystatus', description: 'Show active query status' },
         { command: 'mode', description: 'Show or change permission mode' },
         { command: 'bothelp', description: 'Show help message' },
         // Shortcut commands
@@ -732,7 +805,7 @@ Everything else you type is sent to Claude as a prompt.
         { command: 'push', description: 'Push to origin' },
         { command: 'pr', description: 'Create a pull request' },
         { command: 'changes', description: 'Show git diff summary' },
-        { command: 'status', description: 'Show git status' },
+        { command: 'gitstatus', description: 'Ask Claude for git status' },
       ]);
       logger.log('Registered bot commands with Telegram');
     } catch (error) {

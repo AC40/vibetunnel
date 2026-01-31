@@ -5,11 +5,22 @@
  * Manages Claude sessions using `--resume` for conversation continuity.
  */
 
+import chalk from 'chalk';
 import type { ChildProcess } from 'child_process';
 import { spawn } from 'child_process';
 import { EventEmitter } from 'events';
 import { createInterface } from 'readline';
 import type { ClaudeQueryParams, ClaudeQueryResult, SDKEvent } from './types.js';
+
+// Create a simple logger
+const createLogger = (name: string) => ({
+  log: (...args: unknown[]) => console.log(chalk.blue(`[${name}]`), ...args),
+  error: (...args: unknown[]) => console.error(chalk.red(`[${name}]`), ...args),
+  warn: (...args: unknown[]) => console.warn(chalk.yellow(`[${name}]`), ...args),
+  debug: (...args: unknown[]) => console.debug(chalk.gray(`[${name}]`), ...args),
+});
+
+const logger = createLogger('claude-sdk-bridge');
 
 export interface ClaudeSDKBridgeEvents {
   event: (event: SDKEvent) => void;
@@ -42,8 +53,10 @@ export class ClaudeSDKBridge extends EventEmitter {
     if (this.process.stdout) {
       const rl = createInterface({ input: this.process.stdout });
       rl.on('line', (line) => {
+        logger.debug(`[stdout] ${line.slice(0, 200)}`);
         try {
           const event = JSON.parse(line) as SDKEvent;
+          logger.debug(`[event] type=${event.type}`);
           this.emit('event', event);
 
           // Capture session ID from result or assistant message
@@ -54,7 +67,7 @@ export class ClaudeSDKBridge extends EventEmitter {
             capturedSessionId = event.session_id;
           }
         } catch (_e) {
-          // Not JSON, could be startup message or other output
+          logger.debug(`[non-json] ${line.slice(0, 100)}`);
         }
       });
     }

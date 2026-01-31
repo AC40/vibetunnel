@@ -5,7 +5,13 @@
 /**
  * Permission modes for Claude Code (--permission-mode flag values)
  */
-export type PermissionMode = 'acceptEdits' | 'bypassPermissions' | 'default' | 'delegate' | 'dontAsk' | 'plan';
+export type PermissionMode =
+  | 'acceptEdits'
+  | 'bypassPermissions'
+  | 'default'
+  | 'delegate'
+  | 'dontAsk'
+  | 'plan';
 
 /**
  * All valid permission modes for validation
@@ -94,9 +100,7 @@ export interface ContentBlockStart {
 export interface ContentBlockDelta {
   type: 'content_block_delta';
   index: number;
-  delta:
-    | { type: 'text_delta'; text: string }
-    | { type: 'input_json_delta'; partial_json: string };
+  delta: { type: 'text_delta'; text: string } | { type: 'input_json_delta'; partial_json: string };
 }
 
 export interface ContentBlockStop {

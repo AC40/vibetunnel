@@ -5,9 +5,20 @@
  * Handles batching and truncation for Telegram's message limits.
  */
 
+import chalk from 'chalk';
 import { EventEmitter } from 'events';
 import { detectInteractiveOptions } from './option-detector.js';
 import type { InteractiveOption, SDKEvent, TelegramAction } from './types.js';
+
+// Create a simple logger
+const createLogger = (name: string) => ({
+  log: (...args: unknown[]) => console.log(chalk.blue(`[${name}]`), ...args),
+  error: (...args: unknown[]) => console.error(chalk.red(`[${name}]`), ...args),
+  warn: (...args: unknown[]) => console.warn(chalk.yellow(`[${name}]`), ...args),
+  debug: (...args: unknown[]) => console.debug(chalk.gray(`[${name}]`), ...args),
+});
+
+const logger = createLogger('output-formatter');
 
 const TELEGRAM_MAX_LENGTH = 4000; // Telegram limit is 4096, leave some margin
 const BATCH_DELAY_MS = 500;
@@ -25,27 +36,24 @@ export class OutputFormatter extends EventEmitter {
    * Handle an SDK event from Claude
    */
   handleEvent(event: SDKEvent): TelegramAction | null {
+    logger.debug(`[formatter] Received event type: ${event.type}`);
+
+    let action: TelegramAction | null = null;
+
     if (event.type === 'stream_event') {
       const e = event.event;
 
       if (e.type === 'content_block_start' && e.content_block.type === 'tool_use') {
         this.currentTool = e.content_block.name || 'unknown tool';
-        return { type: 'status', text: `🔧 Using ${this.currentTool}...` };
-      }
-
-      if (e.type === 'content_block_delta' && e.delta.type === 'text_delta') {
+        action = { type: 'status', text: `🔧 Using ${this.currentTool}...` };
+      } else if (e.type === 'content_block_delta' && e.delta.type === 'text_delta') {
         this.textBuffer += e.delta.text;
         this.scheduleBatchSend();
-        return null;
-      }
-
-      if (e.type === 'content_block_stop' && this.currentTool) {
+      } else if (e.type === 'content_block_stop' && this.currentTool) {
         this.currentTool = null;
-        return { type: 'clear_status' };
+        action = { type: 'clear_status' };
       }
-    }
-
-    if (event.type === 'assistant' && event.message?.content) {
+    } else if (event.type === 'assistant' && event.message?.content) {
       // Extract text content from assistant message
       for (const block of event.message.content) {
         if (block.type === 'text' && block.text) {
@@ -53,20 +61,19 @@ export class OutputFormatter extends EventEmitter {
         }
       }
       this.scheduleBatchSend();
-      return null;
-    }
-
-    if (event.type === 'result') {
+    } else if (event.type === 'result') {
       // Flush any remaining text
       this.flushBuffer();
-      return { type: 'notification', text: '✅ Claude is ready for input' };
+      action = { type: 'notification', text: '✅ Claude is ready for input' };
+    } else if (event.type === 'error') {
+      action = { type: 'message', text: `❌ Error: ${event.error.message}` };
     }
 
-    if (event.type === 'error') {
-      return { type: 'message', text: `❌ Error: ${event.error.message}` };
+    if (action) {
+      logger.debug(`[formatter] Emitting action: ${action.type}`);
     }
 
-    return null;
+    return action;
   }
 
   /**
@@ -105,7 +112,7 @@ export class OutputFormatter extends EventEmitter {
 
     // Truncate if too long
     if (cleaned.length > TELEGRAM_MAX_LENGTH) {
-      cleaned = '...' + cleaned.slice(-(TELEGRAM_MAX_LENGTH - 3));
+      cleaned = `...${cleaned.slice(-(TELEGRAM_MAX_LENGTH - 3))}`;
     }
 
     return cleaned;
@@ -141,5 +148,25 @@ export class OutputFormatter extends EventEmitter {
    */
   getCurrentTool(): string | null {
     return this.currentTool;
+  }
+
+  /**
+   * Force flush the buffer and return the text (for exit handling)
+   * Returns the formatted text or null if buffer is empty
+   */
+  forceFlush(): string | null {
+    if (!this.textBuffer) return null;
+
+    // Clear any pending batch timeout
+    if (this.batchTimeout) {
+      clearTimeout(this.batchTimeout);
+      this.batchTimeout = null;
+    }
+
+    const text = this.formatForTelegram(this.textBuffer);
+    this.textBuffer = '';
+
+    logger.debug(`[formatter] Force flushed buffer, ${text.length} chars`);
+    return text;
   }
 }

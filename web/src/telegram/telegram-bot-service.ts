@@ -5,14 +5,14 @@
  */
 
 import chalk from 'chalk';
-import { Bot } from 'grammy';
 import type { Context } from 'grammy';
+import { Bot } from 'grammy';
+import type { ConversationStore } from '../server/claude/conversation-store.js';
 import { ClaudeSDKBridge } from './claude-sdk-bridge.js';
 import { buildModeKeyboard, buildOptionKeyboard } from './keyboards.js';
 import { OutputFormatter } from './output-formatter.js';
 import { SessionManager } from './session-manager.js';
-import type { ConversationStore } from '../server/claude/conversation-store.js';
-import type { PermissionMode, TelegramConfig } from './types.js';
+import type { PermissionMode } from './types.js';
 import { VALID_PERMISSION_MODES } from './types.js';
 
 // Create a simple logger
@@ -33,6 +33,13 @@ export interface TelegramBotServiceConfig {
   conversationStore?: ConversationStore;
 }
 
+interface ActiveQuery {
+  userId: number;
+  prompt: string;
+  startTime: Date;
+  currentTool: string | null;
+}
+
 export class TelegramBotService {
   private bot: Bot;
   private sessionManager: SessionManager;
@@ -41,6 +48,7 @@ export class TelegramBotService {
   private allowUnsafeMode: boolean;
   private activeBridges = new Map<number, ClaudeSDKBridge>();
   private activeFormatters = new Map<number, OutputFormatter>();
+  private activeQueries = new Map<number, ActiveQuery>();
 
   // Reserved bot commands (handled locally, not forwarded to Claude)
   private readonly RESERVED_COMMANDS = new Set([
@@ -52,6 +60,7 @@ export class TelegramBotService {
     'mode',
     'unsafe',
     'cancel',
+    'querystatus',
     '1',
     '2',
     '3',
@@ -113,6 +122,7 @@ export class TelegramBotService {
     this.bot.command('mode', (ctx) => this.handleMode(ctx));
     this.bot.command('unsafe', (ctx) => this.handleUnsafe(ctx));
     this.bot.command('cancel', (ctx) => this.handleCancel(ctx));
+    this.bot.command('querystatus', (ctx) => this.handleQueryStatus(ctx));
 
     // Quick response commands
     for (const num of ['1', '2', '3', '4', '5', '6', '7', '8', '9']) {
@@ -208,6 +218,7 @@ Type /bothelp for all commands.
 
 *Control:*
 /cancel - Interrupt running Claude process
+/querystatus - Show current query status (elapsed time, tool)
 
 *Shortcuts (sent as prompts):*
 /commit [msg] - Create a commit
@@ -376,6 +387,35 @@ Everything else you type is sent to Claude as a prompt.
   }
 
   /**
+   * Handle /querystatus command - shows current query status
+   */
+  private async handleQueryStatus(ctx: Context): Promise<void> {
+    const userId = ctx.from?.id;
+    if (!userId || !this.isAuthorized(userId)) {
+      await ctx.reply('Not authorized');
+      return;
+    }
+
+    const query = this.activeQueries.get(userId);
+    if (!query) {
+      await ctx.reply('No active query. Claude is idle.');
+      return;
+    }
+
+    const elapsed = Math.floor((Date.now() - query.startTime.getTime()) / 1000);
+    const minutes = Math.floor(elapsed / 60);
+    const seconds = elapsed % 60;
+    const tool = query.currentTool ? `\n🔧 Using: ${query.currentTool}` : '';
+
+    await ctx.reply(
+      `📊 *Active Query*\n\n` +
+        `⏱ Running: ${minutes}m ${seconds}s\n` +
+        `📝 Prompt: "${query.prompt.slice(0, 50)}..."${tool}`,
+      { parse_mode: 'Markdown' }
+    );
+  }
+
+  /**
    * Handle quick response commands (/1-/9, /y, /n)
    */
   private async handleQuickResponse(ctx: Context, response: string): Promise<void> {
@@ -479,6 +519,15 @@ Everything else you type is sent to Claude as a prompt.
     const userId = ctx.from?.id;
     if (!userId) return;
 
+    // Check if already processing a query for this user
+    const existingBridge = this.activeBridges.get(userId);
+    if (existingBridge?.isRunning()) {
+      await ctx.reply(
+        '⏳ Claude is already working on a previous message. Use /cancel to interrupt, or wait for it to finish.'
+      );
+      return;
+    }
+
     let session = this.sessionManager.getSession(userId);
     if (!session) {
       session = this.sessionManager.createSession(userId);
@@ -493,6 +542,14 @@ Everything else you type is sent to Claude as a prompt.
 
     this.activeBridges.set(userId, bridge);
     this.activeFormatters.set(userId, formatter);
+
+    // Track active query for /querystatus command
+    this.activeQueries.set(userId, {
+      userId,
+      prompt,
+      startTime: new Date(),
+      currentTool: null,
+    });
 
     // Store user message in conversation history
     if (this.conversationStore && session.claudeSessionId) {
@@ -525,14 +582,24 @@ Everything else you type is sent to Claude as a prompt.
           // Send status message
           const statusMsg = await ctx.reply(action.text);
           statusMessageId = statusMsg.message_id;
-        } else if (action.type === 'clear_status' && statusMessageId) {
+          // Update current tool in activeQueries for /querystatus
+          const query = this.activeQueries.get(userId);
+          if (query) {
+            query.currentTool = action.text.replace('🔧 Using ', '').replace('...', '');
+          }
+        } else if (action.type === 'clear_status' && statusMessageId && ctx.chat?.id) {
           // Delete status message
           try {
-            await ctx.api.deleteMessage(ctx.chat!.id, statusMessageId);
+            await ctx.api.deleteMessage(ctx.chat.id, statusMessageId);
           } catch (_e) {
             // Ignore if already deleted
           }
           statusMessageId = undefined;
+          // Clear current tool in activeQueries
+          const query = this.activeQueries.get(userId);
+          if (query) {
+            query.currentTool = null;
+          }
         } else if (action.type === 'notification') {
           await ctx.reply(action.text);
         }
@@ -556,29 +623,62 @@ Everything else you type is sent to Claude as a prompt.
       }
     });
 
+    // Send periodic "still working" updates so user knows Claude is active
+    let statusUpdateCount = 0;
+    const statusInterval = setInterval(async () => {
+      statusUpdateCount++;
+      const tool = formatter.getCurrentTool();
+      const minutes = statusUpdateCount; // 1 update per minute
+
+      try {
+        if (tool) {
+          // If using a tool, just show typing indicator
+          await ctx.replyWithChatAction('typing');
+        } else if (minutes % 2 === 0) {
+          // Every 2 minutes if no tool activity, send a text message
+          await ctx.reply(`⏳ Claude is still working... (${minutes} min)`);
+        } else {
+          // Odd minutes, just show typing indicator
+          await ctx.replyWithChatAction('typing');
+        }
+      } catch (error) {
+        logger.error('Error sending status update:', error);
+      }
+    }, 60_000); // Every minute
+
+    // Clear interval and flush buffer when Claude process exits
+    bridge.on('exit', async (code) => {
+      clearInterval(statusInterval);
+
+      // Flush any remaining buffered text
+      if (formatter.hasPendingContent()) {
+        const text = formatter.forceFlush();
+        if (text) {
+          try {
+            await ctx.reply(text);
+          } catch (error) {
+            logger.error('Error sending final buffer:', error);
+          }
+        }
+      }
+
+      logger.log(`[forwardToClaude] Claude exited with code ${code}`);
+    });
+
     // Run Claude query in background - don't await to avoid blocking polling
     const runQuery = async () => {
       try {
         logger.log('[forwardToClaude] Starting Claude query...');
 
-        // Add timeout to prevent hanging forever
-        const timeoutMs = 5 * 60 * 1000; // 5 minutes
-        const queryPromise = bridge.query({
+        // No timeout - let Claude work as long as needed
+        // User can always /cancel if needed
+        const result = await bridge.query({
           prompt,
           sessionId: session.claudeSessionId || undefined,
           mode: session.currentMode,
           workingDir: session.workingDir,
           unsafeMode: session.unsafeMode,
         });
-
-        const timeoutPromise = new Promise<never>((_, reject) => {
-          setTimeout(() => {
-            bridge.cancel();
-            reject(new Error('Claude query timed out after 5 minutes'));
-          }, timeoutMs);
-        });
-
-        const result = await Promise.race([queryPromise, timeoutPromise]);
         logger.log('[forwardToClaude] Claude query completed');
 
         // Update session with Claude session ID if new
@@ -600,8 +700,10 @@ Everything else you type is sent to Claude as a prompt.
         logger.error('Claude query failed:', error);
         await ctx.reply(`❌ Error: ${error instanceof Error ? error.message : 'Unknown error'}`);
       } finally {
+        clearInterval(statusInterval);
         this.activeBridges.delete(userId);
         this.activeFormatters.delete(userId);
+        this.activeQueries.delete(userId);
       }
     };
 
@@ -622,6 +724,7 @@ Everything else you type is sent to Claude as a prompt.
         { command: 'sessions', description: 'Show current session info' },
         { command: 'switch', description: 'Switch to a different session' },
         { command: 'cancel', description: 'Interrupt running operation' },
+        { command: 'querystatus', description: 'Show current query status' },
         { command: 'mode', description: 'Show or change permission mode' },
         { command: 'bothelp', description: 'Show help message' },
         // Shortcut commands

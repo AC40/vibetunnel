@@ -15,7 +15,7 @@ export function buildOptionKeyboard(options: InteractiveOption[]): InlineKeyboar
 
   for (const option of options) {
     // Truncate label if too long for button
-    const label = option.label.length > 50 ? option.label.slice(0, 47) + '...' : option.label;
+    const label = option.label.length > 50 ? `${option.label.slice(0, 47)}...` : option.label;
     keyboard.text(`[${option.response}] ${label}`, `option:${option.response}`).row();
   }
 
@@ -42,7 +42,7 @@ export function buildModeKeyboard(currentMode: string): InlineKeyboard {
     { value: 'default', label: '👋 Default', description: 'Normal prompts' },
     { value: 'acceptEdits', label: '✏️ Accept Edits', description: 'Auto-accept edits' },
     { value: 'plan', label: '📝 Plan', description: 'Plan before executing' },
-    { value: 'dontAsk', label: '🚀 Don\'t Ask', description: 'Skip all prompts' },
+    { value: 'dontAsk', label: "🚀 Don't Ask", description: 'Skip all prompts' },
     { value: 'bypassPermissions', label: '⚠️ Bypass', description: 'Skip permission checks' },
   ];
 
@@ -65,7 +65,7 @@ export function buildSessionListKeyboard(
 
   for (const session of sessions) {
     const indicator = session.isCurrent ? ' ✓' : '';
-    const label = session.name.length > 30 ? session.name.slice(0, 27) + '...' : session.name;
+    const label = session.name.length > 30 ? `${session.name.slice(0, 27)}...` : session.name;
     keyboard.text(`${label}${indicator}`, `session:${session.id}`).row();
   }
 

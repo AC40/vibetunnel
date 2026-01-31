@@ -8,7 +8,7 @@
 import chalk from 'chalk';
 import { EventEmitter } from 'events';
 import { detectInteractiveOptions } from './option-detector.js';
-import type { InteractiveOption, SDKEvent, TelegramAction } from './types.js';
+import type { InteractiveOption, SDKEvent, TelegramAction, VerbosityLevel } from './types.js';
 
 // Create a simple logger
 const createLogger = (name: string) => ({
@@ -30,7 +30,43 @@ export interface OutputFormatterEvents {
 export class OutputFormatter extends EventEmitter {
   private textBuffer = '';
   private currentTool: string | null = null;
+  private toolInputBuffer = ''; // Accumulate tool input JSON
+  private lastTextBlockStart = 0; // Track where last text block started
   private batchTimeout: NodeJS.Timeout | null = null;
+  private verbosity: VerbosityLevel = 'normal';
+  private sessionEmoji: string | null = null; // Session emoji to append to messages
+
+  /**
+   * Set verbosity level
+   */
+  setVerbosity(level: VerbosityLevel): void {
+    this.verbosity = level;
+    logger.log(`Verbosity set to: ${level}`);
+  }
+
+  /**
+   * Get current verbosity level
+   */
+  getVerbosity(): VerbosityLevel {
+    return this.verbosity;
+  }
+
+  /**
+   * Set session emoji to append to messages
+   */
+  setSessionEmoji(emoji: string | null): void {
+    this.sessionEmoji = emoji;
+    if (emoji) {
+      logger.log(`Session emoji set to: ${emoji}`);
+    }
+  }
+
+  /**
+   * Get current session emoji
+   */
+  getSessionEmoji(): string | null {
+    return this.sessionEmoji;
+  }
 
   /**
    * Handle an SDK event from Claude
@@ -43,17 +79,37 @@ export class OutputFormatter extends EventEmitter {
     if (event.type === 'stream_event') {
       const e = event.event;
 
-      if (e.type === 'content_block_start' && e.content_block.type === 'tool_use') {
-        this.currentTool = e.content_block.name || 'unknown tool';
-        logger.log(`Tool started: ${this.currentTool}`);
-        action = { type: 'status', text: `🔧 Using ${this.currentTool}...` };
-      } else if (e.type === 'content_block_delta' && e.delta.type === 'text_delta') {
-        this.textBuffer += e.delta.text;
-        this.scheduleBatchSend();
+      if (e.type === 'content_block_start') {
+        if (e.content_block.type === 'tool_use') {
+          this.currentTool = e.content_block.name || 'unknown tool';
+          this.toolInputBuffer = ''; // Reset for new tool
+          logger.log(`Tool started: ${this.currentTool}`);
+          // Only show tool status in normal or verbose mode
+          if (this.verbosity !== 'minimal') {
+            action = { type: 'status', text: `🔧 Using ${this.currentTool}...` };
+          }
+        } else if (e.content_block.type === 'text') {
+          // Track where this text block starts for option detection
+          this.lastTextBlockStart = this.textBuffer.length;
+        }
+      } else if (e.type === 'content_block_delta') {
+        if (e.delta.type === 'text_delta') {
+          this.textBuffer += e.delta.text;
+          this.scheduleBatchSend();
+        } else if (e.delta.type === 'input_json_delta' && this.currentTool) {
+          // Accumulate tool input JSON
+          this.toolInputBuffer += e.delta.partial_json;
+        }
       } else if (e.type === 'content_block_stop' && this.currentTool) {
         logger.log(`Tool stopped: ${this.currentTool}`);
+        // Process completed tool input before clearing
+        this.processToolInput(this.currentTool, this.toolInputBuffer);
         this.currentTool = null;
-        action = { type: 'clear_status' };
+        this.toolInputBuffer = '';
+        // Only clear status in normal or verbose mode
+        if (this.verbosity !== 'minimal') {
+          action = { type: 'clear_status' };
+        }
       }
     } else if (event.type === 'assistant' && event.message?.content) {
       // Extract text content from assistant message
@@ -66,7 +122,10 @@ export class OutputFormatter extends EventEmitter {
     } else if (event.type === 'result') {
       // Flush any remaining text
       this.flushBuffer();
-      action = { type: 'notification', text: '✅ Claude is ready for input' };
+      const readyText = this.sessionEmoji
+        ? `✅ Claude is ready for input ${this.sessionEmoji}`
+        : '✅ Claude is ready for input';
+      action = { type: 'notification', text: readyText };
     } else if (event.type === 'error') {
       action = { type: 'message', text: `❌ Error: ${event.error.message}` };
     }
@@ -78,6 +137,63 @@ export class OutputFormatter extends EventEmitter {
     }
 
     return action;
+  }
+
+  /**
+   * Process completed tool input and extract meaningful content
+   */
+  private processToolInput(toolName: string, inputJson: string): void {
+    if (!inputJson) return;
+
+    try {
+      const input = JSON.parse(inputJson);
+
+      // For Write tool, check if it's a plan file
+      if (toolName === 'Write' && input.content) {
+        const filePath = input.file_path || '';
+        const isPlan =
+          filePath.includes('/plans/') ||
+          filePath.endsWith('plan.md') ||
+          filePath.includes('-plan.md');
+
+        if (isPlan) {
+          const fileName = filePath.split('/').pop() || 'plan.md';
+          logger.log(`Detected plan file: ${fileName} (${input.content.length} chars)`);
+
+          // Send plan as a document
+          this.emit('action', {
+            type: 'document',
+            content: input.content,
+            fileName,
+            caption: '📋 Plan',
+          });
+        } else if (this.verbosity === 'verbose') {
+          // In verbose mode, show previews of written content
+          const preview = input.content.slice(0, 200);
+          const fileName = filePath.split('/').pop() || 'file';
+          logger.log(`Write preview: ${fileName}`);
+          this.emit('action', {
+            type: 'message',
+            text: `📝 Writing to ${fileName}:\n\`\`\`\n${preview}${input.content.length > 200 ? '...' : ''}\n\`\`\``,
+          });
+        }
+      }
+
+      // For Edit tool in verbose mode, show what's being changed
+      if (toolName === 'Edit' && this.verbosity === 'verbose' && input.new_string) {
+        const filePath = input.file_path || '';
+        const fileName = filePath.split('/').pop() || 'file';
+        const preview = input.new_string.slice(0, 100);
+        logger.log(`Edit preview: ${fileName}`);
+        this.emit('action', {
+          type: 'message',
+          text: `✏️ Editing ${fileName}:\n\`\`\`\n${preview}${input.new_string.length > 100 ? '...' : ''}\n\`\`\``,
+        });
+      }
+    } catch (_e) {
+      // Invalid JSON, ignore - this happens during streaming
+      logger.debug('Failed to parse tool input JSON (expected during streaming)');
+    }
   }
 
   /**
@@ -98,14 +214,23 @@ export class OutputFormatter extends EventEmitter {
   private flushBuffer(): void {
     if (!this.textBuffer) return;
 
-    const text = this.formatForTelegram(this.textBuffer);
-    const options = detectInteractiveOptions(this.textBuffer);
+    let text = this.formatForTelegram(this.textBuffer);
+
+    // Append session emoji if set
+    if (this.sessionEmoji) {
+      text = `${text} ${this.sessionEmoji}`;
+    }
+
+    // Only detect options in the LAST text block to avoid merging multiple option groups
+    const textToScanForOptions = this.textBuffer.slice(this.lastTextBlockStart);
+    const options = detectInteractiveOptions(textToScanForOptions);
 
     logger.log(
       `Flushing buffer: ${text.length} chars${options ? `, ${options.length} options` : ''}`
     );
     this.emit('action', { type: 'message', text, options: options || undefined });
     this.textBuffer = '';
+    this.lastTextBlockStart = 0; // Reset for next message
   }
 
   /**

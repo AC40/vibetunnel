@@ -2,18 +2,32 @@
  * Telegram Bot Service
  *
  * Main bot service that handles commands, messages, and Claude integration.
+ * Supports multiple named sessions per user with parallel queries.
  */
 
 import chalk from 'chalk';
 import type { Context } from 'grammy';
-import { Bot } from 'grammy';
+import { Bot, InputFile } from 'grammy';
 import type { ConversationStore } from '../server/claude/conversation-store.js';
 import { ClaudeSDKBridge } from './claude-sdk-bridge.js';
-import { buildModeKeyboard, buildOptionKeyboard } from './keyboards.js';
+import {
+  buildDeleteConfirmKeyboard,
+  buildDirectoryPickerKeyboard,
+  buildModeKeyboard,
+  buildOptionKeyboard,
+  buildSessionSwitcherKeyboard,
+} from './keyboards.js';
 import { OutputFormatter } from './output-formatter.js';
+import {
+  canGoUp,
+  getDirectoryName,
+  getParentPath,
+  listSubdirectories,
+  resolveAndValidatePath,
+} from './path-utils.js';
 import { SessionManager } from './session-manager.js';
-import type { PermissionMode } from './types.js';
-import { VALID_PERMISSION_MODES } from './types.js';
+import type { PermissionMode, VerbosityLevel } from './types.js';
+import { VALID_PERMISSION_MODES, VALID_VERBOSITY_LEVELS } from './types.js';
 
 // Create a simple logger
 const createLogger = (name: string) => ({
@@ -31,13 +45,22 @@ export interface TelegramBotServiceConfig {
   allowUnsafeMode?: boolean;
   controlDir: string;
   conversationStore?: ConversationStore;
+  defaultWorkingDir?: string;
+  maxSessionsPerUser?: number;
 }
 
 interface ActiveQuery {
   userId: number;
+  sessionId: string;
   prompt: string;
   startTime: Date;
   currentTool: string | null;
+}
+
+interface DirectoryPickerState {
+  currentPath: string;
+  purpose: 'new_session' | 'change_dir';
+  sessionName?: string; // For new_session with custom name
 }
 
 export class TelegramBotService {
@@ -46,9 +69,15 @@ export class TelegramBotService {
   private conversationStore?: ConversationStore;
   private allowedUsers: Set<number>;
   private allowUnsafeMode: boolean;
-  private activeBridges = new Map<number, ClaudeSDKBridge>();
-  private activeFormatters = new Map<number, OutputFormatter>();
-  private activeQueries = new Map<number, ActiveQuery>();
+  private defaultWorkingDir: string;
+
+  // Per-session bridges and formatters (keyed by session.id)
+  private activeBridges = new Map<string, ClaudeSDKBridge>();
+  private activeFormatters = new Map<string, OutputFormatter>();
+  private activeQueries = new Map<string, ActiveQuery>();
+
+  // Directory picker state per user
+  private activeDirectoryPickers = new Map<number, DirectoryPickerState>();
 
   // Reserved bot commands (handled locally, not forwarded to Claude)
   private readonly RESERVED_COMMANDS = new Set([
@@ -57,11 +86,15 @@ export class TelegramBotService {
     'new',
     'sessions',
     'switch',
+    'cd',
+    'delete',
+    'rename',
     'mode',
     'unsafe',
     'cancel',
     'querystatus',
     'status',
+    'verbosity',
     '1',
     '2',
     '3',
@@ -86,7 +119,11 @@ export class TelegramBotService {
 
   constructor(config: TelegramBotServiceConfig) {
     this.bot = new Bot(config.botToken);
-    this.sessionManager = new SessionManager(config.controlDir);
+    this.defaultWorkingDir = config.defaultWorkingDir ?? process.cwd();
+    this.sessionManager = new SessionManager(config.controlDir, {
+      maxSessions: config.maxSessionsPerUser,
+      defaultWorkingDir: this.defaultWorkingDir,
+    });
     this.conversationStore = config.conversationStore;
     this.allowedUsers = new Set(config.allowedUsers || []);
     this.allowUnsafeMode = config.allowUnsafeMode ?? false;
@@ -120,11 +157,15 @@ export class TelegramBotService {
     this.bot.command('new', (ctx) => this.handleNew(ctx));
     this.bot.command('sessions', (ctx) => this.handleSessions(ctx));
     this.bot.command('switch', (ctx) => this.handleSwitch(ctx));
+    this.bot.command('cd', (ctx) => this.handleCd(ctx));
+    this.bot.command('delete', (ctx) => this.handleDelete(ctx));
+    this.bot.command('rename', (ctx) => this.handleRename(ctx));
     this.bot.command('mode', (ctx) => this.handleMode(ctx));
     this.bot.command('unsafe', (ctx) => this.handleUnsafe(ctx));
     this.bot.command('cancel', (ctx) => this.handleCancel(ctx));
     this.bot.command('querystatus', (ctx) => this.handleQueryStatus(ctx));
     this.bot.command('status', (ctx) => this.handleStatus(ctx));
+    this.bot.command('verbosity', (ctx) => this.handleVerbosity(ctx));
 
     // Quick response commands
     for (const num of ['1', '2', '3', '4', '5', '6', '7', '8', '9']) {
@@ -174,9 +215,14 @@ export class TelegramBotService {
     }
 
     // Create session if doesn't exist
-    let session = this.sessionManager.getSession(userId);
+    let session = this.sessionManager.getActiveSession(userId);
     if (!session) {
-      session = this.sessionManager.createSession(userId);
+      const result = this.sessionManager.createSession(userId);
+      if ('error' in result) {
+        await ctx.reply(`Error creating session: ${result.error}`);
+        return;
+      }
+      session = result.session;
     }
 
     const welcomeMessage = `
@@ -189,7 +235,7 @@ Control Claude Code remotely through Telegram.
 • Use /new to start a fresh session
 • Use /mode to change permission mode
 
-*Current Session:*
+*Current Session: ${session.name}* ${session.emoji}
 • Mode: ${session.currentMode}
 • Working Dir: \`${session.workingDir}\`
 
@@ -208,11 +254,15 @@ Type /bothelp for all commands.
 *VibeTunnel Claude Bot Commands*
 
 *Session Management:*
-/new [dir] - Start new session (optional: working directory)
-/sessions - List your sessions
-/switch <id> - Switch to a different session
+/new [name] [path] - Create new session
+/sessions - List all your sessions
+/switch <name> - Switch to a different session
+/cd [path] - Change working directory
+/delete <name> - Delete a session
+/rename <name> - Rename current session
 /mode [mode] - Show or change permission mode
 /unsafe - Toggle dangerously-skip-permissions mode
+/verbosity [level] - Control output detail
 
 *Quick Responses:*
 /1 - /9 - Send number to Claude
@@ -220,7 +270,7 @@ Type /bothelp for all commands.
 
 *Control:*
 /cancel - Interrupt running Claude process
-/status - Show session status (mode, dir, active query)
+/status - Show session status
 /querystatus - Show active query status only
 
 *Shortcuts (sent as prompts):*
@@ -230,9 +280,6 @@ Type /bothelp for all commands.
 /changes - Show git changes
 /gitstatus - Ask Claude for git status
 
-*Claude Commands (forwarded directly):*
-/help, /clear, /compact, /mode, etc.
-
 Everything else you type is sent to Claude as a prompt.
     `.trim();
 
@@ -240,7 +287,7 @@ Everything else you type is sent to Claude as a prompt.
   }
 
   /**
-   * Handle /new command
+   * Handle /new command - create new session
    */
   private async handleNew(ctx: Context): Promise<void> {
     const userId = ctx.from?.id;
@@ -250,14 +297,66 @@ Everything else you type is sent to Claude as a prompt.
     }
 
     const args = ctx.message?.text?.split(' ').slice(1) || [];
-    const workingDir = args[0] || process.cwd();
+    const sessionName = args[0];
+    const pathArg = args[1];
 
-    // Create new session
-    const session = this.sessionManager.createSession(userId, workingDir);
+    if (pathArg) {
+      // Path provided, validate and create session
+      const session = this.sessionManager.getActiveSession(userId);
+      const basePath = session?.workingDir || this.defaultWorkingDir;
+      const validation = resolveAndValidatePath(pathArg, basePath);
+
+      if (!validation.valid) {
+        await ctx.reply(`❌ ${validation.error}`);
+        return;
+      }
+
+      const result = this.sessionManager.createSession(userId, sessionName, validation.resolved);
+      if ('error' in result) {
+        await ctx.reply(`❌ ${result.error}`);
+        return;
+      }
+
+      await ctx.reply(
+        `✅ Created session: *${result.session.name}* ${result.session.emoji}\n\n` +
+          `📁 \`${result.session.workingDir}\`\n` +
+          `🔐 Mode: ${result.session.currentMode}`,
+        { parse_mode: 'Markdown' }
+      );
+    } else {
+      // No path provided, show directory picker
+      const startPath = this.defaultWorkingDir;
+      await this.showDirectoryPicker(ctx, userId, startPath, 'new_session', sessionName);
+    }
+  }
+
+  /**
+   * Show directory picker for interactive folder selection
+   */
+  private async showDirectoryPicker(
+    ctx: Context,
+    userId: number,
+    basePath: string,
+    purpose: 'new_session' | 'change_dir',
+    sessionName?: string
+  ): Promise<void> {
+    const directories = await listSubdirectories(basePath);
+
+    // Store picker state
+    this.activeDirectoryPickers.set(userId, {
+      currentPath: basePath,
+      purpose,
+      sessionName,
+    });
+
+    const keyboard = buildDirectoryPickerKeyboard(directories, canGoUp(basePath));
+
+    const purposeText =
+      purpose === 'new_session' ? 'Select Directory for New Session' : 'Select Working Directory';
 
     await ctx.reply(
-      `✅ New session created!\n\nMode: ${session.currentMode}\nWorking Dir: \`${session.workingDir}\``,
-      { parse_mode: 'Markdown' }
+      `📂 *${purposeText}*\n\nCurrent: \`${basePath}\`\n\nChoose a folder or select this location:`,
+      { parse_mode: 'Markdown', reply_markup: keyboard }
     );
   }
 
@@ -271,14 +370,14 @@ Everything else you type is sent to Claude as a prompt.
       return;
     }
 
-    const session = this.sessionManager.getSession(userId);
-    if (!session) {
-      await ctx.reply('No active session. Use /new to start one.');
+    const sessions = this.sessionManager.getSessionsForUser(userId);
+    if (sessions.length === 0) {
+      await ctx.reply('No sessions. Use /new to create one.');
       return;
     }
 
-    const info = this.sessionManager.getSessionInfo(userId);
-    await ctx.reply(`*Your Session:*\n\`\`\`\n${info}\n\`\`\``, { parse_mode: 'Markdown' });
+    const formatted = this.sessionManager.getSessionListFormatted(userId);
+    await ctx.reply(formatted, { parse_mode: 'Markdown' });
   }
 
   /**
@@ -293,14 +392,139 @@ Everything else you type is sent to Claude as a prompt.
 
     const args = ctx.message?.text?.split(' ').slice(1) || [];
     if (args.length === 0) {
-      await ctx.reply('Usage: /switch <session_id>');
+      // Show session switcher keyboard
+      const sessions = this.sessionManager.getSessionsForUser(userId);
+      if (sessions.length === 0) {
+        await ctx.reply('No sessions. Use /new to create one.');
+        return;
+      }
+
+      const profile = this.sessionManager.getProfile(userId)!;
+      const keyboard = buildSessionSwitcherKeyboard(
+        sessions.map((s) => ({
+          id: s.id,
+          name: s.name,
+          emoji: s.emoji,
+          isActive: s.id === profile.activeSessionId,
+        }))
+      );
+
+      await ctx.reply('Select a session:', { reply_markup: keyboard });
       return;
     }
 
-    const sessionId = args[0];
-    this.sessionManager.setClaudeSessionId(userId, sessionId);
+    const sessionName = args.join(' ');
+    const result = this.sessionManager.switchSession(userId, sessionName);
 
-    await ctx.reply(`Switched to session: \`${sessionId}\``, { parse_mode: 'Markdown' });
+    if ('error' in result) {
+      await ctx.reply(`❌ ${result.error}`);
+      return;
+    }
+
+    await ctx.reply(
+      `Switched to session: *${result.session.name}* ${result.session.emoji}\n\n` +
+        `📁 \`${result.session.workingDir}\``,
+      { parse_mode: 'Markdown' }
+    );
+  }
+
+  /**
+   * Handle /cd command - change working directory
+   */
+  private async handleCd(ctx: Context): Promise<void> {
+    const userId = ctx.from?.id;
+    if (!userId || !this.isAuthorized(userId)) {
+      await ctx.reply('Not authorized');
+      return;
+    }
+
+    const session = this.sessionManager.getActiveSession(userId);
+    if (!session) {
+      await ctx.reply('No active session. Use /new to start one.');
+      return;
+    }
+
+    const args = ctx.message?.text?.split(' ').slice(1) || [];
+
+    if (args.length === 0) {
+      // No path provided, show directory picker
+      await this.showDirectoryPicker(ctx, userId, session.workingDir, 'change_dir');
+      return;
+    }
+
+    const pathArg = args.join(' ');
+    const validation = resolveAndValidatePath(pathArg, session.workingDir);
+
+    if (!validation.valid) {
+      await ctx.reply(`❌ ${validation.error}`);
+      return;
+    }
+
+    this.sessionManager.setWorkingDir(userId, validation.resolved);
+    await ctx.reply(
+      `📁 Working directory changed to:\n\`${validation.resolved}\` ${session.emoji}`,
+      { parse_mode: 'Markdown' }
+    );
+  }
+
+  /**
+   * Handle /delete command
+   */
+  private async handleDelete(ctx: Context): Promise<void> {
+    const userId = ctx.from?.id;
+    if (!userId || !this.isAuthorized(userId)) {
+      await ctx.reply('Not authorized');
+      return;
+    }
+
+    const args = ctx.message?.text?.split(' ').slice(1) || [];
+    if (args.length === 0) {
+      await ctx.reply('Usage: /delete <session_name>');
+      return;
+    }
+
+    const sessionName = args.join(' ');
+    const session = this.sessionManager.getSessionByName(userId, sessionName);
+
+    if (!session) {
+      await ctx.reply(`❌ Session "${sessionName}" not found.`);
+      return;
+    }
+
+    // Show confirmation
+    await ctx.reply(`Are you sure you want to delete session *${session.name}* ${session.emoji}?`, {
+      parse_mode: 'Markdown',
+      reply_markup: buildDeleteConfirmKeyboard(session.name),
+    });
+  }
+
+  /**
+   * Handle /rename command
+   */
+  private async handleRename(ctx: Context): Promise<void> {
+    const userId = ctx.from?.id;
+    if (!userId || !this.isAuthorized(userId)) {
+      await ctx.reply('Not authorized');
+      return;
+    }
+
+    const args = ctx.message?.text?.split(' ').slice(1) || [];
+    if (args.length === 0) {
+      await ctx.reply('Usage: /rename <new_name>');
+      return;
+    }
+
+    const newName = args.join(' ');
+    const result = this.sessionManager.renameSession(userId, newName);
+
+    if ('error' in result) {
+      await ctx.reply(`❌ ${result.error}`);
+      return;
+    }
+
+    await ctx.reply(`✅ Session renamed to: *${result.session.name}* ${result.session.emoji}`, {
+      parse_mode: 'Markdown',
+    });
   }
 
   /**
@@ -313,7 +537,7 @@ Everything else you type is sent to Claude as a prompt.
       return;
     }
 
-    const session = this.sessionManager.getSession(userId);
+    const session = this.sessionManager.getActiveSession(userId);
     if (!session) {
       await ctx.reply('No active session. Use /new to start one.');
       return;
@@ -323,7 +547,7 @@ Everything else you type is sent to Claude as a prompt.
 
     if (args.length === 0) {
       // Show current mode with keyboard
-      await ctx.reply(`Current mode: *${session.currentMode}*\n\nSelect a mode:`, {
+      await ctx.reply(`Current mode: *${session.currentMode}* ${session.emoji}\n\nSelect a mode:`, {
         parse_mode: 'Markdown',
         reply_markup: buildModeKeyboard(session.currentMode),
       });
@@ -337,7 +561,7 @@ Everything else you type is sent to Claude as a prompt.
     }
 
     this.sessionManager.setMode(userId, newMode);
-    await ctx.reply(`Mode set to: *${newMode}*`, { parse_mode: 'Markdown' });
+    await ctx.reply(`Mode set to: *${newMode}* ${session.emoji}`, { parse_mode: 'Markdown' });
   }
 
   /**
@@ -355,7 +579,7 @@ Everything else you type is sent to Claude as a prompt.
       return;
     }
 
-    const session = this.sessionManager.getSession(userId);
+    const session = this.sessionManager.getActiveSession(userId);
     if (!session) {
       await ctx.reply('No active session. Use /new to start one.');
       return;
@@ -367,7 +591,9 @@ Everything else you type is sent to Claude as a prompt.
       ? '\n\n⚠️ *Warning:* Claude will run tools without asking for permission!'
       : '';
 
-    await ctx.reply(`Unsafe mode: ${status}${warning}`, { parse_mode: 'Markdown' });
+    await ctx.reply(`Unsafe mode: ${status} ${session.emoji}${warning}`, {
+      parse_mode: 'Markdown',
+    });
   }
 
   /**
@@ -380,12 +606,18 @@ Everything else you type is sent to Claude as a prompt.
       return;
     }
 
-    const bridge = this.activeBridges.get(userId);
+    const session = this.sessionManager.getActiveSession(userId);
+    if (!session) {
+      await ctx.reply('No active session.');
+      return;
+    }
+
+    const bridge = this.activeBridges.get(session.id);
     if (bridge?.isRunning()) {
       bridge.cancel();
-      await ctx.reply('🛑 Cancelled running operation');
+      await ctx.reply(`🛑 Cancelled running operation ${session.emoji}`);
     } else {
-      await ctx.reply('No running operation to cancel');
+      await ctx.reply(`No running operation to cancel ${session.emoji}`);
     }
   }
 
@@ -399,9 +631,15 @@ Everything else you type is sent to Claude as a prompt.
       return;
     }
 
-    const query = this.activeQueries.get(userId);
+    const session = this.sessionManager.getActiveSession(userId);
+    if (!session) {
+      await ctx.reply('No active session.');
+      return;
+    }
+
+    const query = this.activeQueries.get(session.id);
     if (!query) {
-      await ctx.reply('No active query. Claude is idle.');
+      await ctx.reply(`No active query. Claude is idle. ${session.emoji}`);
       return;
     }
 
@@ -411,7 +649,7 @@ Everything else you type is sent to Claude as a prompt.
     const tool = query.currentTool ? `\n🔧 Using: ${query.currentTool}` : '';
 
     await ctx.reply(
-      `📊 *Active Query*\n\n` +
+      `📊 *Active Query* ${session.emoji}\n\n` +
         `⏱ Running: ${minutes}m ${seconds}s\n` +
         `📝 Prompt: "${query.prompt.slice(0, 50)}..."${tool}`,
       { parse_mode: 'Markdown' }
@@ -428,15 +666,18 @@ Everything else you type is sent to Claude as a prompt.
       return;
     }
 
-    const session = this.sessionManager.getSession(userId);
+    const session = this.sessionManager.getActiveSession(userId);
     if (!session) {
       await ctx.reply('No active session. Use /new to start one.');
       return;
     }
 
+    const profile = this.sessionManager.getProfile(userId)!;
+    const sessionCount = profile.sessions.length;
+
     // Build session info
     const sessionInfo = [
-      `*Session Status*`,
+      `*Session: ${session.name}* ${session.emoji} (${sessionCount} total)`,
       ``,
       `📁 Working Dir: \`${session.workingDir}\``,
       `🔐 Mode: ${session.currentMode}${session.unsafeMode ? ' (UNSAFE)' : ''}`,
@@ -450,7 +691,7 @@ Everything else you type is sent to Claude as a prompt.
     }
 
     // Add active query info
-    const query = this.activeQueries.get(userId);
+    const query = this.activeQueries.get(session.id);
     if (query) {
       const elapsed = Math.floor((Date.now() - query.startTime.getTime()) / 1000);
       const minutes = Math.floor(elapsed / 60);
@@ -466,7 +707,67 @@ Everything else you type is sent to Claude as a prompt.
       sessionInfo.push(`💤 Claude is idle`);
     }
 
+    // Show running queries in other sessions
+    const otherRunning: string[] = [];
+    for (const s of profile.sessions) {
+      if (s.id !== session.id && this.activeQueries.has(s.id)) {
+        otherRunning.push(`${s.emoji} ${s.name}`);
+      }
+    }
+    if (otherRunning.length > 0) {
+      sessionInfo.push(``);
+      sessionInfo.push(`*Running in other sessions:*`);
+      sessionInfo.push(otherRunning.join(', '));
+    }
+
     await ctx.reply(sessionInfo.join('\n'), { parse_mode: 'Markdown' });
+  }
+
+  /**
+   * Handle /verbosity command - control output detail level
+   */
+  private async handleVerbosity(ctx: Context): Promise<void> {
+    const userId = ctx.from?.id;
+    if (!userId || !this.isAuthorized(userId)) {
+      await ctx.reply('Not authorized');
+      return;
+    }
+
+    const session = this.sessionManager.getActiveSession(userId);
+    if (!session) {
+      await ctx.reply('No active session. Use /new to start one.');
+      return;
+    }
+
+    const args = ctx.message?.text?.split(' ').slice(1) || [];
+
+    if (args.length === 0) {
+      // Show current verbosity with options
+      const levels = VALID_VERBOSITY_LEVELS.map((level) => {
+        const current = session.verbosity === level ? ' ✓' : '';
+        const desc = {
+          minimal: 'Final message only, no tool status',
+          normal: 'Tool names + results (default)',
+          verbose: 'Everything including tool content previews',
+        }[level];
+        return `• *${level}*${current}: ${desc}`;
+      }).join('\n');
+
+      await ctx.reply(
+        `*Output Verbosity* ${session.emoji}\n\nCurrent: *${session.verbosity}*\n\n${levels}\n\nUsage: /verbosity <level>`,
+        { parse_mode: 'Markdown' }
+      );
+      return;
+    }
+
+    const newLevel = args[0].toLowerCase() as VerbosityLevel;
+    if (!VALID_VERBOSITY_LEVELS.includes(newLevel)) {
+      await ctx.reply(`Invalid level. Valid levels: ${VALID_VERBOSITY_LEVELS.join(', ')}`);
+      return;
+    }
+
+    this.sessionManager.setVerbosity(userId, newLevel);
+    await ctx.reply(`Verbosity set to: *${newLevel}* ${session.emoji}`, { parse_mode: 'Markdown' });
   }
 
   /**
@@ -490,33 +791,166 @@ Everything else you type is sent to Claude as a prompt.
 
     await ctx.answerCallbackQuery();
 
+    // Directory picker callbacks
+    if (data.startsWith('dir:')) {
+      await this.handleDirectoryPickerCallback(ctx, userId, data);
+      return;
+    }
+
+    // Session switcher callbacks
+    if (data.startsWith('switch:')) {
+      const sessionIdOrAction = data.replace('switch:', '');
+      if (sessionIdOrAction === 'new') {
+        // Create new session via picker
+        await this.showDirectoryPicker(ctx, userId, this.defaultWorkingDir, 'new_session');
+      } else {
+        const result = this.sessionManager.switchSession(userId, sessionIdOrAction);
+        if ('error' in result) {
+          await ctx.editMessageText(`❌ ${result.error}`);
+        } else {
+          await ctx.editMessageText(
+            `Switched to session: *${result.session.name}* ${result.session.emoji}`,
+            { parse_mode: 'Markdown' }
+          );
+        }
+      }
+      return;
+    }
+
+    // Delete confirmation callbacks
+    if (data.startsWith('delete:')) {
+      const action = data.replace('delete:', '');
+      if (action === 'cancel') {
+        await ctx.editMessageText('Deletion cancelled.');
+      } else if (action.startsWith('confirm:')) {
+        const sessionName = action.replace('confirm:', '');
+        const result = this.sessionManager.deleteSession(userId, sessionName);
+        if ('error' in result) {
+          await ctx.editMessageText(`❌ ${result.error}`);
+        } else {
+          await ctx.editMessageText(`🗑️ Session "${sessionName}" deleted.`);
+        }
+      }
+      return;
+    }
+
+    // Option callbacks (from Claude output)
     if (data.startsWith('option:')) {
       const response = data.replace('option:', '');
       if (response === 'cancel') {
-        const bridge = this.activeBridges.get(userId);
-        if (bridge?.isRunning()) {
-          bridge.cancel();
-          await ctx.reply('🛑 Cancelled');
+        const session = this.sessionManager.getActiveSession(userId);
+        if (session) {
+          const bridge = this.activeBridges.get(session.id);
+          if (bridge?.isRunning()) {
+            bridge.cancel();
+            await ctx.reply(`🛑 Cancelled ${session.emoji}`);
+          }
         }
       } else {
         await this.forwardToClaude(ctx, response);
       }
-    } else if (data.startsWith('mode:')) {
+      return;
+    }
+
+    // Mode selection callbacks
+    if (data.startsWith('mode:')) {
       const mode = data.replace('mode:', '') as PermissionMode;
       this.sessionManager.setMode(userId, mode);
-      await ctx.editMessageText(`Mode set to: *${mode}*`, { parse_mode: 'Markdown' });
-    } else if (data.startsWith('quick:')) {
+      const session = this.sessionManager.getActiveSession(userId);
+      const emoji = session?.emoji || '';
+      await ctx.editMessageText(`Mode set to: *${mode}* ${emoji}`, { parse_mode: 'Markdown' });
+      return;
+    }
+
+    // Quick action callbacks
+    if (data.startsWith('quick:')) {
       const action = data.replace('quick:', '');
       const prompt = this.SHORTCUT_PROMPTS[action];
       if (prompt) {
         await this.forwardToClaude(ctx, prompt);
       } else if (action === 'cancel') {
-        const bridge = this.activeBridges.get(userId);
-        if (bridge?.isRunning()) {
-          bridge.cancel();
-          await ctx.reply('🛑 Cancelled');
+        const session = this.sessionManager.getActiveSession(userId);
+        if (session) {
+          const bridge = this.activeBridges.get(session.id);
+          if (bridge?.isRunning()) {
+            bridge.cancel();
+            await ctx.reply(`🛑 Cancelled ${session.emoji}`);
+          }
         }
       }
+      return;
+    }
+  }
+
+  /**
+   * Handle directory picker callback queries
+   */
+  private async handleDirectoryPickerCallback(
+    ctx: Context,
+    userId: number,
+    data: string
+  ): Promise<void> {
+    const action = data.replace('dir:', '');
+    const picker = this.activeDirectoryPickers.get(userId);
+
+    if (!picker) {
+      await ctx.editMessageText('Directory picker expired. Please try again.');
+      return;
+    }
+
+    if (action === 'select') {
+      // Use current path
+      this.activeDirectoryPickers.delete(userId);
+
+      if (picker.purpose === 'new_session') {
+        const name = picker.sessionName || getDirectoryName(picker.currentPath);
+        const result = this.sessionManager.createSession(userId, name, picker.currentPath);
+        if ('error' in result) {
+          await ctx.editMessageText(`❌ ${result.error}`);
+        } else {
+          await ctx.editMessageText(
+            `✅ Created session: *${result.session.name}* ${result.session.emoji}\n\n` +
+              `📁 \`${result.session.workingDir}\``,
+            { parse_mode: 'Markdown' }
+          );
+        }
+      } else {
+        // change_dir
+        this.sessionManager.setWorkingDir(userId, picker.currentPath);
+        const session = this.sessionManager.getActiveSession(userId);
+        await ctx.editMessageText(
+          `📁 Working directory changed to:\n\`${picker.currentPath}\` ${session?.emoji || ''}`,
+          { parse_mode: 'Markdown' }
+        );
+      }
+    } else if (action === 'parent') {
+      const parentPath = getParentPath(picker.currentPath);
+      const directories = await listSubdirectories(parentPath);
+
+      picker.currentPath = parentPath;
+      this.activeDirectoryPickers.set(userId, picker);
+
+      const keyboard = buildDirectoryPickerKeyboard(directories, canGoUp(parentPath));
+      await ctx.editMessageText(
+        `📂 *Select Directory*\n\nCurrent: \`${parentPath}\`\n\nChoose a folder or select this location:`,
+        { parse_mode: 'Markdown', reply_markup: keyboard }
+      );
+    } else if (action === 'cancel') {
+      this.activeDirectoryPickers.delete(userId);
+      await ctx.editMessageText('Directory selection cancelled.');
+    } else {
+      // Navigate into subdirectory
+      const newPath = `${picker.currentPath}/${action}`;
+      const directories = await listSubdirectories(newPath);
+
+      picker.currentPath = newPath;
+      this.activeDirectoryPickers.set(userId, picker);
+
+      const keyboard = buildDirectoryPickerKeyboard(directories, canGoUp(newPath));
+      await ctx.editMessageText(
+        `📂 *Select Directory*\n\nCurrent: \`${newPath}\`\n\nChoose a folder or select this location:`,
+        { parse_mode: 'Markdown', reply_markup: keyboard }
+      );
     }
   }
 
@@ -578,24 +1012,31 @@ Everything else you type is sent to Claude as a prompt.
       `[user:${userId}] Forwarding to Claude: "${prompt.slice(0, 50)}..." (${prompt.length} chars)`
     );
 
-    // Check if already processing a query for this user
-    const existingBridge = this.activeBridges.get(userId);
+    // Get or create session
+    let session = this.sessionManager.getActiveSession(userId);
+    if (!session) {
+      const result = this.sessionManager.createSession(userId);
+      if ('error' in result) {
+        await ctx.reply(`❌ ${result.error}`);
+        return;
+      }
+      session = result.session;
+      logger.log(`[user:${userId}] Created new session: ${session.name}`);
+    }
+
+    // Check if THIS session is already processing a query
+    const existingBridge = this.activeBridges.get(session.id);
     if (existingBridge?.isRunning()) {
-      logger.log(`[user:${userId}] Already has active query, rejecting`);
+      logger.log(`[user:${userId}] Session ${session.name} is busy, rejecting`);
       await ctx.reply(
-        '⏳ Claude is already working on a previous message. Use /cancel to interrupt, or wait for it to finish.'
+        `⏳ Session "${session.name}" ${session.emoji} is busy.\n\n` +
+          `Use /switch to another session, or /cancel to interrupt.`
       );
       return;
     }
 
-    let session = this.sessionManager.getSession(userId);
-    if (!session) {
-      session = this.sessionManager.createSession(userId);
-      logger.log(`[user:${userId}] Created new session`);
-    }
-
     logger.log(
-      `[user:${userId}] Session: mode=${session.currentMode}, claudeSession=${session.claudeSessionId || 'new'}`
+      `[user:${userId}] Session: ${session.name} ${session.emoji}, mode=${session.currentMode}, claudeSession=${session.claudeSessionId || 'new'}`
     );
 
     // Show typing indicator
@@ -604,14 +1045,17 @@ Everything else you type is sent to Claude as a prompt.
     // Create new bridge and formatter for this request
     const bridge = new ClaudeSDKBridge();
     const formatter = new OutputFormatter();
-    logger.log(`[user:${userId}] Created bridge and formatter`);
+    formatter.setVerbosity(session.verbosity);
+    formatter.setSessionEmoji(session.emoji);
+    logger.log(`[user:${userId}] Created bridge and formatter (verbosity: ${session.verbosity})`);
 
-    this.activeBridges.set(userId, bridge);
-    this.activeFormatters.set(userId, formatter);
+    this.activeBridges.set(session.id, bridge);
+    this.activeFormatters.set(session.id, formatter);
 
     // Track active query for /querystatus command
-    this.activeQueries.set(userId, {
+    this.activeQueries.set(session.id, {
       userId,
+      sessionId: session.id,
       prompt,
       startTime: new Date(),
       currentTool: null,
@@ -649,7 +1093,7 @@ Everything else you type is sent to Claude as a prompt.
           const statusMsg = await ctx.reply(action.text);
           statusMessageId = statusMsg.message_id;
           // Update current tool in activeQueries for /querystatus
-          const query = this.activeQueries.get(userId);
+          const query = this.activeQueries.get(session!.id);
           if (query) {
             query.currentTool = action.text.replace('🔧 Using ', '').replace('...', '');
           }
@@ -662,12 +1106,27 @@ Everything else you type is sent to Claude as a prompt.
           }
           statusMessageId = undefined;
           // Clear current tool in activeQueries
-          const query = this.activeQueries.get(userId);
+          const query = this.activeQueries.get(session!.id);
           if (query) {
             query.currentTool = null;
           }
         } else if (action.type === 'notification') {
           await ctx.reply(action.text);
+        } else if (action.type === 'document') {
+          // Send content as a downloadable file
+          try {
+            await ctx.replyWithDocument(
+              new InputFile(Buffer.from(action.content, 'utf-8'), action.fileName),
+              { caption: action.caption }
+            );
+          } catch (docError) {
+            logger.error('Error sending document:', docError);
+            // Fallback to sending as text (truncated if needed)
+            const preview = action.content.slice(0, 3500);
+            await ctx.reply(
+              `📋 ${action.fileName}:\n\n${preview}${action.content.length > 3500 ? '\n\n...(truncated)' : ''}`
+            );
+          }
         }
       } catch (error) {
         logger.error('Error handling action:', error);
@@ -685,7 +1144,7 @@ Everything else you type is sent to Claude as a prompt.
       logger.error('Claude error:', errorText);
       // Only send error if it's significant
       if (errorText.includes('Error') || errorText.includes('error')) {
-        await ctx.reply(`⚠️ ${errorText.slice(0, 200)}`);
+        await ctx.reply(`⚠️ ${errorText.slice(0, 200)} ${session!.emoji}`);
       }
     });
 
@@ -702,7 +1161,7 @@ Everything else you type is sent to Claude as a prompt.
           await ctx.replyWithChatAction('typing');
         } else if (minutes % 2 === 0) {
           // Every 2 minutes if no tool activity, send a text message
-          await ctx.reply(`⏳ Claude is still working... (${minutes} min)`);
+          await ctx.reply(`⏳ Claude is still working... (${minutes} min) ${session!.emoji}`);
         } else {
           // Odd minutes, just show typing indicator
           await ctx.replyWithChatAction('typing');
@@ -711,6 +1170,9 @@ Everything else you type is sent to Claude as a prompt.
         logger.error('Error sending status update:', error);
       }
     }, 60_000); // Every minute
+
+    // Capture session for closure
+    const currentSession = session;
 
     // Clear interval and flush buffer when Claude process exits
     bridge.on('exit', async (code) => {
@@ -721,7 +1183,11 @@ Everything else you type is sent to Claude as a prompt.
         const text = formatter.forceFlush();
         if (text) {
           try {
-            await ctx.reply(text);
+            // Add emoji suffix if not already present
+            const textWithEmoji = text.endsWith(currentSession.emoji)
+              ? text
+              : `${text} ${currentSession.emoji}`;
+            await ctx.reply(textWithEmoji);
           } catch (error) {
             logger.error('Error sending final buffer:', error);
           }
@@ -734,16 +1200,16 @@ Everything else you type is sent to Claude as a prompt.
     // Run Claude query in background - don't await to avoid blocking polling
     const runQuery = async () => {
       try {
-        logger.log(`[user:${userId}] Starting Claude query...`);
+        logger.log(`[user:${userId}] Starting Claude query for session ${currentSession.name}...`);
 
         // No timeout - let Claude work as long as needed
         // User can always /cancel if needed
         const result = await bridge.query({
           prompt,
-          sessionId: session.claudeSessionId || undefined,
-          mode: session.currentMode,
-          workingDir: session.workingDir,
-          unsafeMode: session.unsafeMode,
+          sessionId: currentSession.claudeSessionId || undefined,
+          mode: currentSession.currentMode,
+          workingDir: currentSession.workingDir,
+          unsafeMode: currentSession.unsafeMode,
         });
 
         const elapsed = ((Date.now() - queryStartTime) / 1000).toFixed(1);
@@ -752,7 +1218,7 @@ Everything else you type is sent to Claude as a prompt.
         );
 
         // Update session with Claude session ID if new
-        if (!session.claudeSessionId && result.sessionId) {
+        if (!currentSession.claudeSessionId && result.sessionId) {
           this.sessionManager.setClaudeSessionId(userId, result.sessionId);
           logger.log(`[user:${userId}] Updated session ID to ${result.sessionId}`);
         }
@@ -770,12 +1236,14 @@ Everything else you type is sent to Claude as a prompt.
       } catch (error) {
         const elapsed = ((Date.now() - queryStartTime) / 1000).toFixed(1);
         logger.error(`[user:${userId}] Query failed after ${elapsed}s:`, error);
-        await ctx.reply(`❌ Error: ${error instanceof Error ? error.message : 'Unknown error'}`);
+        await ctx.reply(
+          `❌ Error: ${error instanceof Error ? error.message : 'Unknown error'} ${currentSession.emoji}`
+        );
       } finally {
         clearInterval(statusInterval);
-        this.activeBridges.delete(userId);
-        this.activeFormatters.delete(userId);
-        this.activeQueries.delete(userId);
+        this.activeBridges.delete(currentSession.id);
+        this.activeFormatters.delete(currentSession.id);
+        this.activeQueries.delete(currentSession.id);
       }
     };
 
@@ -792,13 +1260,17 @@ Everything else you type is sent to Claude as a prompt.
     try {
       await this.bot.api.setMyCommands([
         { command: 'start', description: 'Initialize the bot' },
-        { command: 'new', description: 'Start a new Claude session' },
-        { command: 'sessions', description: 'Show current session info' },
+        { command: 'new', description: 'Create a new named session' },
+        { command: 'sessions', description: 'List all your sessions' },
         { command: 'switch', description: 'Switch to a different session' },
+        { command: 'cd', description: 'Change working directory' },
+        { command: 'delete', description: 'Delete a session' },
+        { command: 'rename', description: 'Rename current session' },
         { command: 'cancel', description: 'Interrupt running operation' },
         { command: 'status', description: 'Show session status' },
         { command: 'querystatus', description: 'Show active query status' },
         { command: 'mode', description: 'Show or change permission mode' },
+        { command: 'verbosity', description: 'Control output detail level' },
         { command: 'bothelp', description: 'Show help message' },
         // Shortcut commands
         { command: 'commit', description: 'Create a git commit' },

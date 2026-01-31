@@ -26,16 +26,50 @@ export const VALID_PERMISSION_MODES: PermissionMode[] = [
 ];
 
 /**
+ * Verbosity levels for Telegram output
+ */
+export type VerbosityLevel = 'minimal' | 'normal' | 'verbose';
+
+/**
+ * All valid verbosity levels for validation
+ */
+export const VALID_VERBOSITY_LEVELS: VerbosityLevel[] = ['minimal', 'normal', 'verbose'];
+
+/**
+ * Animal emojis for session identification
+ * Each session gets a unique emoji for visual distinction
+ */
+export const SESSION_EMOJIS = ['🦊', '🐻', '🦁', '🐯', '🦄', '🐺', '🦅', '🐬', '🦉', '🐙'];
+
+/**
+ * Default maximum number of sessions per user
+ */
+export const DEFAULT_MAX_SESSIONS = 5;
+
+/**
  * User session tracking Telegram user → Claude session mapping
  */
 export interface UserSession {
+  id: string; // Unique session identifier (e.g., "session-1")
+  name: string; // Human-readable name (e.g., "vibetunnel", "other-project")
+  emoji: string; // Unique animal emoji for visual identification
   telegramUserId: number;
   claudeSessionId: string;
   currentMode: PermissionMode;
   workingDir: string;
   unsafeMode: boolean;
+  verbosity: VerbosityLevel;
   createdAt: Date;
   lastActivity: Date;
+}
+
+/**
+ * User profile containing multiple named sessions
+ */
+export interface UserProfile {
+  telegramUserId: number;
+  sessions: UserSession[];
+  activeSessionId: string; // ID of the currently active session
 }
 
 /**
@@ -46,6 +80,8 @@ export interface TelegramConfig {
   botToken: string;
   allowedUsers?: number[];
   allowUnsafeMode?: boolean;
+  defaultWorkingDir?: string; // Configurable base directory for new sessions
+  maxSessionsPerUser?: number; // Maximum sessions per user (default: 5)
 }
 
 /**
@@ -79,10 +115,17 @@ export interface InteractiveOption {
  * Actions to perform on Telegram
  */
 export type TelegramAction =
-  | { type: 'message'; text: string; options?: InteractiveOption[] }
+  | {
+      type: 'message';
+      text: string;
+      options?: InteractiveOption[];
+      isPlan?: boolean;
+      fileName?: string;
+    }
   | { type: 'status'; text: string }
   | { type: 'clear_status' }
-  | { type: 'notification'; text: string };
+  | { type: 'notification'; text: string }
+  | { type: 'document'; content: string; fileName: string; caption?: string };
 
 /**
  * SDK Event types from Claude Code's stream-json output

@@ -935,7 +935,7 @@ export class TerminalChatView extends LitElement {
     // Wait for response after selecting an option
     this.waitingForResponse = true;
 
-    logger.log(`Selected option ${index + 1}: ${option}`);
+    logger.log(`Selected option ${option.response}: ${option.label}`);
   }
 
   /**

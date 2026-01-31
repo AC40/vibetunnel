@@ -75,6 +75,10 @@ export abstract class HeaderBase extends LitElement {
     this.dispatchEvent(new CustomEvent('open-tmux-sessions'));
   }
 
+  protected handleOpenClaudeSessions() {
+    this.dispatchEvent(new CustomEvent('open-claude-sessions'));
+  }
+
   protected handleOpenSettings() {
     this.showUserMenu = false;
     this.dispatchEvent(new CustomEvent('open-settings'));

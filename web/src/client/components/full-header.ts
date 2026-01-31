@@ -70,6 +70,15 @@ export class FullHeader extends HeaderBase {
               </svg>
             </button>
             <button
+              class="p-2 bg-bg-tertiary text-muted border border-border hover:border-primary hover:text-primary hover:bg-surface-hover rounded-lg transition-all duration-200"
+              @click=${this.handleOpenClaudeSessions}
+              title="Claude Sessions"
+            >
+              <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
+                <path d="M8 1C4.134 1 1 4.134 1 8s3.134 7 7 7 7-3.134 7-7-3.134-7-7-7zm0 1.5c3.038 0 5.5 2.462 5.5 5.5s-2.462 5.5-5.5 5.5S2.5 11.038 2.5 8 4.962 2.5 8 2.5zM5.5 6a.75.75 0 100 1.5.75.75 0 000-1.5zm5 0a.75.75 0 100 1.5.75.75 0 000-1.5zM5 9.5a.5.5 0 00-.447.724C4.81 10.727 6.07 12 8 12s3.19-1.273 3.447-1.776A.5.5 0 0011 9.5H5z"/>
+              </svg>
+            </button>
+            <button
               class="p-2 bg-primary text-text-bright hover:bg-primary-light rounded-lg transition-all duration-200 vt-create-button"
               @click=${this.handleCreateSession}
               title="Create New Session"

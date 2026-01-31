@@ -31,6 +31,10 @@ import './components/settings.js';
 import './components/notification-status.js';
 import './components/auth-login.js';
 import './components/ssh-key-manager.js';
+import './components/claude-sessions-list.js';
+import './components/claude-session-view.js';
+import './components/claude-message.js';
+import './components/claude-input.js';
 
 import { authClient } from './services/auth-client.js';
 import { pushNotificationService } from './services/push-notification-service.js';
@@ -57,7 +61,7 @@ export class VibeTunnelApp extends LitElement {
   @state() private successMessage = '';
   @state() private sessions: Session[] = [];
   @state() private loading = false;
-  @state() private currentView: 'list' | 'session' | 'auth' | 'file-browser' = 'auth';
+  @state() private currentView: 'list' | 'session' | 'auth' | 'file-browser' | 'claude-sessions' = 'auth';
   @state() private selectedSessionId: string | null = null;
   @state() private hideExited = this.loadHideExitedState();
   @state() private showCreateModal = false;
@@ -65,6 +69,7 @@ export class VibeTunnelApp extends LitElement {
   @state() private showTmuxModal = false;
   @state() private showSSHKeyManager = false;
   @state() private showSettings = false;
+  @state() private selectedClaudeSessionId: string | null = null;
   @state() private isAuthenticated = false;
   @state() private sidebarCollapsed = this.loadSidebarState();
   @state() private sidebarWidth = this.loadSidebarWidth();
@@ -1531,6 +1536,30 @@ export class VibeTunnelApp extends LitElement {
     this.handleCreateSession();
   };
 
+  private handleOpenClaudeSessions = () => {
+    this.currentView = 'claude-sessions';
+    this.selectedClaudeSessionId = null;
+    this.updateUrl();
+  };
+
+  private handleClaudeSessionSelected = (e: CustomEvent) => {
+    this.selectedClaudeSessionId = e.detail.sessionId;
+  };
+
+  private handleClaudeSessionBack = () => {
+    if (this.selectedClaudeSessionId) {
+      this.selectedClaudeSessionId = null;
+    } else {
+      this.currentView = 'list';
+      this.updateUrl();
+    }
+  };
+
+  private handleNewClaudeSession = () => {
+    // Start with no session ID - view will create one on first message
+    this.selectedClaudeSessionId = 'new';
+  };
+
   private handleOpenTmuxSessions = () => {
     this.showTmuxModal = true;
   };
@@ -1788,6 +1817,46 @@ export class VibeTunnelApp extends LitElement {
                 @insert-path=${this.handleNavigateToList}
               ></file-browser>
             `
+            : this.currentView === 'claude-sessions'
+            ? html`
+              <!-- Claude Sessions view -->
+              <div class="flex h-screen bg-secondary">
+                <div class="w-80 border-r border-border flex-shrink-0">
+                  <claude-sessions-list
+                    .selectedSessionId=${this.selectedClaudeSessionId}
+                    @session-selected=${this.handleClaudeSessionSelected}
+                    @new-session=${this.handleNewClaudeSession}
+                  ></claude-sessions-list>
+                </div>
+                <div class="flex-1">
+                  ${this.selectedClaudeSessionId
+                    ? html`
+                        <claude-session-view
+                          .sessionId=${this.selectedClaudeSessionId === 'new' ? null : this.selectedClaudeSessionId}
+                          @back=${this.handleClaudeSessionBack}
+                          @session-created=${(e: CustomEvent) => {
+                            this.selectedClaudeSessionId = e.detail.sessionId;
+                          }}
+                        ></claude-session-view>
+                      `
+                    : html`
+                        <div class="flex items-center justify-center h-full text-text-muted">
+                          <div class="text-center">
+                            <div class="text-4xl mb-4">💬</div>
+                            <div class="text-lg">Select a session or start a new one</div>
+                          </div>
+                        </div>
+                      `}
+                </div>
+                <button
+                  class="fixed top-4 left-4 p-2 bg-bg-elevated rounded-lg border border-border hover:bg-bg-secondary"
+                  @click=${this.handleClaudeSessionBack}
+                  title="Back to sessions list"
+                >
+                  ← Back
+                </button>
+              </div>
+            `
             : html`
       <!-- Main content with split view support -->
       <div class="${this.mainContainerClasses}">
@@ -1822,6 +1891,7 @@ export class VibeTunnelApp extends LitElement {
             @clean-exited-sessions=${this.handleCleanExited}
             @open-file-browser=${this.handleOpenFileBrowser}
             @open-tmux-sessions=${this.handleOpenTmuxSessions}
+            @open-claude-sessions=${this.handleOpenClaudeSessions}
             @open-settings=${this.handleOpenSettings}
             @logout=${this.handleLogout}
             @navigate-to-list=${this.handleNavigateToList}

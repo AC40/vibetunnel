@@ -17,6 +17,7 @@
     "src/server/**/*",
     "src/shared/**/*",
     "src/types/**/*",
+    "src/telegram/**/*",
     "src/cli.ts"
   ],
   "exclude": [

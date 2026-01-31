@@ -49,6 +49,10 @@ import { closeLogger, createLogger, initLogger, setDebugMode } from './utils/log
 import { VapidManager } from './utils/vapid-manager.js';
 import { getVersionInfo, printVersionBanner } from './version.js';
 import { controlUnixHandler } from './websocket/control-unix-handler.js';
+import { ConversationStore } from './claude/conversation-store.js';
+import { createClaudeSessionRoutes } from './claude/claude-session-api.js';
+import { TelegramBotService } from '../telegram/telegram-bot-service.js';
+import { SessionManager as TelegramSessionManager } from '../telegram/session-manager.js';
 
 // Extended WebSocket request with authentication and routing info
 interface WebSocketRequest extends http.IncomingMessage {
@@ -139,6 +143,11 @@ interface Config {
   ngrokRegion: string | null;
   // Cloudflare tunnel configuration
   enableCloudflare: boolean;
+  // Telegram bot configuration
+  enableTelegram: boolean;
+  telegramBotToken: string | null;
+  telegramUsers: number[];
+  telegramAllowUnsafe: boolean;
 }
 
 // Show help message
@@ -178,6 +187,12 @@ Tunnel Options:
   --ngrok-region <reg>  Ngrok region (us, eu, ap, au, sa, jp, in)
   --cloudflare          Enable Cloudflare tunnel (Quick Tunnel)
 
+Telegram Bot Options:
+  --telegram            Enable Telegram bot for remote Claude control
+  --telegram-token <t>  Telegram bot token (or TELEGRAM_BOT_TOKEN env var)
+  --telegram-users <ids> Comma-separated allowed user IDs (auto-whitelist first user if empty)
+  --telegram-unsafe     Allow users to enable dangerously-skip-permissions mode
+
 HQ Mode Options:
   --hq                  Run as HQ (headquarters) server
 
@@ -196,6 +211,7 @@ Environment Variables:
   VIBETUNNEL_CONTROL_DIR Control directory for session data
   PUSH_CONTACT_EMAIL    Contact email for VAPID configuration
   NGROK_AUTHTOKEN       Ngrok auth token (used with --ngrok)
+  TELEGRAM_BOT_TOKEN    Telegram bot token (used with --telegram)
 
 Examples:
   # Run a simple server with authentication
@@ -263,6 +279,11 @@ function parseArgs(): Config {
     ngrokRegion: null as string | null,
     // Cloudflare tunnel configuration
     enableCloudflare: false,
+    // Telegram bot configuration
+    enableTelegram: false,
+    telegramBotToken: (process.env.TELEGRAM_BOT_TOKEN?.trim() || null) as string | null,
+    telegramUsers: [] as number[],
+    telegramAllowUnsafe: false,
   };
 
   // Check for help flag first
@@ -348,6 +369,20 @@ function parseArgs(): Config {
       i++; // Skip the region value in next iteration
     } else if (args[i] === '--cloudflare') {
       config.enableCloudflare = true;
+    } else if (args[i] === '--telegram') {
+      config.enableTelegram = true;
+    } else if (args[i] === '--telegram-token' && i + 1 < args.length) {
+      config.telegramBotToken = args[i + 1];
+      config.enableTelegram = true;
+      i++;
+    } else if (args[i] === '--telegram-users' && i + 1 < args.length) {
+      config.telegramUsers = args[i + 1]
+        .split(',')
+        .map((id) => Number.parseInt(id.trim(), 10))
+        .filter((id) => !Number.isNaN(id));
+      i++;
+    } else if (args[i] === '--telegram-unsafe') {
+      config.telegramAllowUnsafe = true;
     } else if (args[i].startsWith('--')) {
       // Unknown argument
       logger.error(`Unknown argument: ${args[i]}`);
@@ -444,6 +479,8 @@ interface AppInstance {
   hqClient: HQClient | null;
   controlDirWatcher: ControlDirWatcher | null;
   pushNotificationService: PushNotificationService | null;
+  telegramBot: TelegramBotService | null;
+  conversationStore: ConversationStore | null;
 }
 
 // Track if app has been created
@@ -1152,6 +1189,53 @@ export async function createApp(): Promise<AppInstance> {
   app.use('/api', createTestNotificationRouter({ sessionMonitor, pushNotificationService }));
   logger.debug('Mounted test notification routes');
 
+  // Initialize Claude Session API and Telegram bot
+  let conversationStore: ConversationStore | null = null;
+  let telegramBot: TelegramBotService | null = null;
+  const telegramSessionManager = new TelegramSessionManager(CONTROL_DIR);
+
+  // Always initialize conversation store for Claude Sessions
+  conversationStore = new ConversationStore(CONTROL_DIR);
+  logger.debug('Initialized conversation store for Claude sessions');
+
+  // Mount Claude Session API routes
+  app.use(
+    '/api',
+    createClaudeSessionRoutes({
+      conversationStore,
+      sessionManager: telegramSessionManager,
+    })
+  );
+  logger.debug('Mounted Claude Session API routes');
+
+  // Initialize Telegram bot if enabled
+  if (config.enableTelegram && config.telegramBotToken) {
+    try {
+      telegramBot = new TelegramBotService({
+        botToken: config.telegramBotToken,
+        allowedUsers: config.telegramUsers,
+        allowUnsafeMode: config.telegramAllowUnsafe,
+        controlDir: CONTROL_DIR,
+        conversationStore,
+      });
+      // Don't await start here - it blocks. Start in background.
+      telegramBot
+        .start()
+        .then(() => {
+          logger.log(chalk.green('Telegram bot: ENABLED'));
+        })
+        .catch((error) => {
+          logger.error(chalk.red('Failed to start Telegram bot:'), error.message);
+        });
+    } catch (error) {
+      logger.error('Failed to initialize Telegram bot:', error);
+    }
+  } else if (config.enableTelegram && !config.telegramBotToken) {
+    logger.error(
+      chalk.red('Telegram bot enabled but no token provided. Use --telegram-token or TELEGRAM_BOT_TOKEN')
+    );
+  }
+
   // Initialize control socket
   try {
     await controlUnixHandler.start();
@@ -1618,6 +1702,8 @@ export async function createApp(): Promise<AppInstance> {
     hqClient,
     controlDirWatcher,
     pushNotificationService,
+    telegramBot,
+    conversationStore,
   };
 }
 
@@ -1744,6 +1830,13 @@ export async function startVibeTunnelServer() {
       if (controlDirWatcher) {
         controlDirWatcher.stop();
         logger.debug('Stopped control directory watcher');
+      }
+
+      // Stop Telegram bot if it was started
+      if (appInstance.telegramBot) {
+        logger.log('Stopping Telegram bot...');
+        await appInstance.telegramBot.stop();
+        logger.debug('Stopped Telegram bot');
       }
 
       // Stop UNIX socket server

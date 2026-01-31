@@ -61,6 +61,7 @@ export class AppHeader extends LitElement {
         @clean-exited-sessions=${this.forwardEvent}
         @open-file-browser=${this.forwardEvent}
         @open-tmux-sessions=${this.forwardEvent}
+        @open-claude-sessions=${this.forwardEvent}
         @open-settings=${this.forwardEvent}
         @logout=${this.forwardEvent}
         @navigate-to-list=${this.forwardEvent}
@@ -82,6 +83,7 @@ export class AppHeader extends LitElement {
         @clean-exited-sessions=${this.forwardEvent}
         @open-file-browser=${this.forwardEvent}
         @open-tmux-sessions=${this.forwardEvent}
+        @open-claude-sessions=${this.forwardEvent}
         @open-settings=${this.forwardEvent}
         @logout=${this.forwardEvent}
         @navigate-to-list=${this.forwardEvent}

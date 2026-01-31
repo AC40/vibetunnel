@@ -10,12 +10,15 @@ import { EventEmitter } from 'events';
 import { detectInteractiveOptions } from './option-detector.js';
 import type { InteractiveOption, SDKEvent, TelegramAction, VerbosityLevel } from './types.js';
 
-// Create a simple logger
+// Debug mode: set TELEGRAM_DEBUG=true or TELEGRAM_DEBUG=1 for verbose logging
+const isDebug = process.env.TELEGRAM_DEBUG === 'true' || process.env.TELEGRAM_DEBUG === '1';
+const noop = () => {};
+
 const createLogger = (name: string) => ({
-  log: (...args: unknown[]) => console.log(chalk.blue(`[${name}]`), ...args),
+  log: isDebug ? (...args: unknown[]) => console.log(chalk.blue(`[${name}]`), ...args) : noop,
   error: (...args: unknown[]) => console.error(chalk.red(`[${name}]`), ...args),
   warn: (...args: unknown[]) => console.warn(chalk.yellow(`[${name}]`), ...args),
-  debug: (...args: unknown[]) => console.debug(chalk.gray(`[${name}]`), ...args),
+  debug: isDebug ? (...args: unknown[]) => console.debug(chalk.gray(`[${name}]`), ...args) : noop,
 });
 
 const logger = createLogger('output-formatter');

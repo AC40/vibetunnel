@@ -111,15 +111,6 @@ export class TelegramBotService {
     'n',
   ]);
 
-  // Shortcut commands (translated to prompts for Claude)
-  private readonly SHORTCUT_PROMPTS: Record<string, string> = {
-    commit: 'Create a commit for the current changes with an appropriate message',
-    push: 'Push the current branch to origin',
-    pr: 'Create a pull request for the current branch',
-    changes: 'Show me a summary of git changes (like git diff --stat)',
-    gitstatus: "What's the current git status and working directory?",
-  };
-
   constructor(config: TelegramBotServiceConfig) {
     this.bot = new Bot(config.botToken);
     this.defaultWorkingDir = config.defaultWorkingDir ?? process.cwd();
@@ -276,12 +267,9 @@ Type /bothelp for all commands.
 /status - Show session status
 /querystatus - Show active query status only
 
-*Shortcuts (sent as prompts):*
-/commit [msg] - Create a commit
-/push - Push current branch
-/pr [title] - Create a pull request
-/changes - Show git changes
-/gitstatus - Ask Claude for git status
+*Bang Mode:*
+Start a message with \`!\` to execute it as a bash command directly.
+Example: \`!ls -la\` or \`!git status\`
 
 Everything else you type is sent to Claude as a prompt.
     `.trim();
@@ -868,10 +856,7 @@ Everything else you type is sent to Claude as a prompt.
     // Quick action callbacks
     if (data.startsWith('quick:')) {
       const action = data.replace('quick:', '');
-      const prompt = this.SHORTCUT_PROMPTS[action];
-      if (prompt) {
-        await this.forwardToClaude(ctx, prompt);
-      } else if (action === 'cancel') {
+      if (action === 'cancel') {
         const session = this.sessionManager.getActiveSession(userId);
         if (session) {
           const bridge = this.activeBridges.get(session.id);
@@ -978,7 +963,7 @@ Everything else you type is sent to Claude as a prompt.
 
     // Check if it's a command
     if (text.startsWith('/')) {
-      const [cmd, ...args] = text.slice(1).split(' ');
+      const [cmd] = text.slice(1).split(' ');
       const cmdLower = cmd.toLowerCase();
 
       // Reserved bot commands are handled by specific handlers above
@@ -987,12 +972,20 @@ Everything else you type is sent to Claude as a prompt.
         return; // Already handled by grammY command handlers
       }
 
-      // Shortcut prompts (translate to Claude prompt)
-      if (cmdLower in this.SHORTCUT_PROMPTS) {
-        logger.log(`[handleMessage] Shortcut command /${cmdLower}`);
-        const basePrompt = this.SHORTCUT_PROMPTS[cmdLower];
-        const prompt = args.length > 0 ? `${basePrompt}: ${args.join(' ')}` : basePrompt;
-        return this.forwardToClaude(ctx, prompt);
+      // Unknown command - show error
+      logger.log(`[handleMessage] Unknown command /${cmdLower}`);
+      await ctx.reply(
+        `❓ Unknown command: /${cmd}\n\nUse /bothelp to see available commands.`
+      );
+      return;
+    }
+
+    // Bang mode: execute as bash command
+    if (text.startsWith('!')) {
+      const command = text.slice(1).trim();
+      if (command) {
+        logger.log(`[handleMessage] Bang mode: executing "${command}"`);
+        return this.executeBashCommand(ctx, command);
       }
     }
 
@@ -1257,6 +1250,69 @@ Everything else you type is sent to Claude as a prompt.
   }
 
   /**
+   * Execute a bash command directly (bang mode)
+   */
+  private async executeBashCommand(ctx: Context, command: string): Promise<void> {
+    const userId = ctx.from?.id;
+    if (!userId) return;
+
+    // Get session for working directory
+    const session = this.sessionManager.getActiveSession(userId);
+    const workingDir = session?.workingDir ?? this.defaultWorkingDir;
+
+    logger.log(`[user:${userId}] Executing bash command in ${workingDir}: ${command}`);
+
+    await ctx.replyWithChatAction('typing');
+
+    try {
+      const { spawn } = await import('child_process');
+      const proc = spawn('bash', ['-c', command], {
+        cwd: workingDir,
+        env: { ...process.env },
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+
+      let stdout = '';
+      let stderr = '';
+
+      proc.stdout?.on('data', (data) => {
+        stdout += data.toString();
+      });
+      proc.stderr?.on('data', (data) => {
+        stderr += data.toString();
+      });
+
+      const exitCode = await new Promise<number | null>((resolve) => {
+        proc.on('close', resolve);
+        proc.on('error', () => resolve(null));
+      });
+
+      // Format output
+      let output = '';
+      if (stdout) output += stdout;
+      if (stderr) output += (output ? '\n' : '') + stderr;
+
+      // Truncate if too long for Telegram (4000 char limit)
+      if (output.length > 3900) {
+        output = output.slice(0, 3900) + '\n...(truncated)';
+      }
+
+      const prefix = exitCode === 0 ? '✓' : `✗ (exit ${exitCode})`;
+      const emoji = session?.emoji ?? '';
+      const reply = output
+        ? `${prefix}\n\`\`\`\n${output}\n\`\`\` ${emoji}`
+        : `${prefix} (no output) ${emoji}`;
+
+      await ctx.reply(reply, { parse_mode: 'Markdown' });
+    } catch (error) {
+      const emoji = session?.emoji ?? '';
+      await ctx.reply(
+        `❌ Error: ${error instanceof Error ? error.message : 'Unknown error'} ${emoji}`
+      );
+    }
+  }
+
+  /**
    * Register bot commands with Telegram (shows in command menu)
    */
   private async registerCommands(): Promise<void> {
@@ -1275,12 +1331,6 @@ Everything else you type is sent to Claude as a prompt.
         { command: 'mode', description: 'Show or change permission mode' },
         { command: 'verbosity', description: 'Control output detail level' },
         { command: 'bothelp', description: 'Show help message' },
-        // Shortcut commands
-        { command: 'commit', description: 'Create a git commit' },
-        { command: 'push', description: 'Push to origin' },
-        { command: 'pr', description: 'Create a pull request' },
-        { command: 'changes', description: 'Show git diff summary' },
-        { command: 'gitstatus', description: 'Ask Claude for git status' },
       ]);
       logger.log('Registered bot commands with Telegram');
     } catch (error) {

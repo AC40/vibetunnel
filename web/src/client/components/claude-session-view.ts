@@ -388,16 +388,17 @@ export class ClaudeSessionView extends LitElement {
       </div>
 
       <div class="messages-container">
-        ${this.messages.length === 0
-          ? html`
+        ${
+          this.messages.length === 0
+            ? html`
               <div class="empty-state">
                 <div class="empty-state-icon">💬</div>
                 <div class="empty-state-title">Start a Conversation</div>
                 <div>Send a message to start chatting with Claude</div>
               </div>
             `
-          : this.messages.map(
-              (msg) => html`
+            : this.messages.map(
+                (msg) => html`
                 <claude-message
                   .role=${msg.role}
                   .content=${msg.content}
@@ -405,7 +406,8 @@ export class ClaudeSessionView extends LitElement {
                   .toolUse=${msg.toolUse || []}
                 ></claude-message>
               `
-            )}
+              )
+        }
       </div>
 
       <claude-input

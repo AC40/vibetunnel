@@ -102,11 +102,7 @@ export class ConversationStore extends EventEmitter {
   /**
    * Add or update tool use status for the last assistant message
    */
-  updateToolUse(
-    sessionId: string,
-    toolName: string,
-    status: 'running' | 'complete'
-  ): void {
+  updateToolUse(sessionId: string, toolName: string, status: 'running' | 'complete'): void {
     const history = this.messages.get(sessionId);
     if (history && history.length > 0) {
       const lastMessage = history[history.length - 1];

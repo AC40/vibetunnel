@@ -8,7 +8,13 @@
 import chalk from 'chalk';
 import { EventEmitter } from 'events';
 import { detectInteractiveOptions } from './option-detector.js';
-import type { InteractiveOption, SDKEvent, TelegramAction, VerbosityLevel } from './types.js';
+import type {
+  ClaudeQuestion,
+  InteractiveOption,
+  SDKEvent,
+  TelegramAction,
+  VerbosityLevel,
+} from './types.js';
 
 // Debug mode: set TELEGRAM_DEBUG=true or TELEGRAM_DEBUG=1 for verbose logging
 const isDebug = process.env.TELEGRAM_DEBUG === 'true' || process.env.TELEGRAM_DEBUG === '1';
@@ -119,6 +125,9 @@ export class OutputFormatter extends EventEmitter {
       for (const block of event.message.content) {
         if (block.type === 'text' && block.text) {
           this.textBuffer += block.text;
+        } else if (block.type === 'tool_use' && block.name && block.input) {
+          // Process tool_use blocks (e.g., AskUserQuestion)
+          this.processToolInput(block.name, JSON.stringify(block.input));
         }
       }
       this.scheduleBatchSend();
@@ -146,10 +155,34 @@ export class OutputFormatter extends EventEmitter {
    * Process completed tool input and extract meaningful content
    */
   private processToolInput(toolName: string, inputJson: string): void {
-    if (!inputJson) return;
+    // ALWAYS log tool completions for debugging AskUserQuestion
+    console.log(`[telegram] Tool completed: ${toolName}`);
+
+    if (!inputJson) {
+      console.log(`[telegram] Tool ${toolName} has no input JSON`);
+      return;
+    }
 
     try {
       const input = JSON.parse(inputJson);
+
+      // Special logging for AskUserQuestion
+      if (toolName === 'AskUserQuestion') {
+        console.log(`[telegram] AskUserQuestion detected!`);
+        console.log(`[telegram] Input:`, JSON.stringify(input, null, 2).slice(0, 500));
+
+        if (input.questions && Array.isArray(input.questions)) {
+          const questions = input.questions as ClaudeQuestion[];
+          console.log(`[telegram] Emitting user_question with ${questions.length} question(s)`);
+          this.emit('action', {
+            type: 'user_question',
+            questions,
+          });
+          return;
+        } else {
+          console.log(`[telegram] AskUserQuestion missing questions array!`);
+        }
+      }
 
       // For Write tool, check if it's a plan file
       if (toolName === 'Write' && input.content) {
@@ -163,12 +196,13 @@ export class OutputFormatter extends EventEmitter {
           const fileName = filePath.split('/').pop() || 'plan.md';
           logger.log(`Detected plan file: ${fileName} (${input.content.length} chars)`);
 
-          // Send plan as a document
+          // Send plan as a document with isPlan flag for approval workflow
           this.emit('action', {
             type: 'document',
             content: input.content,
             fileName,
             caption: '📋 Plan',
+            isPlan: true,
           });
         } else if (this.verbosity === 'verbose') {
           // In verbose mode, show previews of written content

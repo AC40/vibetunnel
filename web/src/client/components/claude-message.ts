@@ -160,8 +160,9 @@ export class ClaudeMessage extends LitElement {
         </div>
         <div class="message-bubble">
           <pre class="message-content">${this.content}</pre>
-          ${this.toolUse && this.toolUse.length > 0
-            ? html`
+          ${
+            this.toolUse && this.toolUse.length > 0
+              ? html`
                 <div class="tool-indicators">
                   ${this.toolUse.map(
                     (tool) => html`
@@ -175,7 +176,8 @@ export class ClaudeMessage extends LitElement {
                   )}
                 </div>
               `
-            : ''}
+              : ''
+          }
         </div>
       </div>
     `;

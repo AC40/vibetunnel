@@ -79,6 +79,8 @@ export class ClaudeSDKBridge extends EventEmitter {
               streamEvent.type === 'content_block_start' &&
               streamEvent.content_block?.type === 'tool_use'
             ) {
+              // ALWAYS log tool starts for debugging AskUserQuestion
+              console.log(`[telegram] Tool started: ${streamEvent.content_block.name}`);
               logger.log(`Event: content_block_start (tool: ${streamEvent.content_block.name})`);
             } else if (streamEvent.type === 'content_block_stop') {
               logger.log(`Event: content_block_stop`);

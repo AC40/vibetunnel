@@ -61,7 +61,8 @@ export class VibeTunnelApp extends LitElement {
   @state() private successMessage = '';
   @state() private sessions: Session[] = [];
   @state() private loading = false;
-  @state() private currentView: 'list' | 'session' | 'auth' | 'file-browser' | 'claude-sessions' = 'auth';
+  @state() private currentView: 'list' | 'session' | 'auth' | 'file-browser' | 'claude-sessions' =
+    'auth';
   @state() private selectedSessionId: string | null = null;
   @state() private hideExited = this.loadHideExitedState();
   @state() private showCreateModal = false;
@@ -1818,7 +1819,7 @@ export class VibeTunnelApp extends LitElement {
               ></file-browser>
             `
             : this.currentView === 'claude-sessions'
-            ? html`
+              ? html`
               <!-- Claude Sessions view -->
               <div class="flex h-screen bg-secondary">
                 <div class="w-80 border-r border-border flex-shrink-0">
@@ -1829,8 +1830,9 @@ export class VibeTunnelApp extends LitElement {
                   ></claude-sessions-list>
                 </div>
                 <div class="flex-1">
-                  ${this.selectedClaudeSessionId
-                    ? html`
+                  ${
+                    this.selectedClaudeSessionId
+                      ? html`
                         <claude-session-view
                           .sessionId=${this.selectedClaudeSessionId === 'new' ? null : this.selectedClaudeSessionId}
                           @back=${this.handleClaudeSessionBack}
@@ -1839,14 +1841,15 @@ export class VibeTunnelApp extends LitElement {
                           }}
                         ></claude-session-view>
                       `
-                    : html`
+                      : html`
                         <div class="flex items-center justify-center h-full text-text-muted">
                           <div class="text-center">
                             <div class="text-4xl mb-4">💬</div>
                             <div class="text-lg">Select a session or start a new one</div>
                           </div>
                         </div>
-                      `}
+                      `
+                  }
                 </div>
                 <button
                   class="fixed top-4 left-4 p-2 bg-bg-elevated rounded-lg border border-border hover:bg-bg-secondary"
@@ -1857,7 +1860,7 @@ export class VibeTunnelApp extends LitElement {
                 </button>
               </div>
             `
-            : html`
+              : html`
       <!-- Main content with split view support -->
       <div class="${this.mainContainerClasses}">
         <!-- Mobile overlay when sidebar is open -->

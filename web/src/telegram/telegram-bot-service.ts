@@ -11,11 +11,14 @@ import { Bot, InputFile } from 'grammy';
 import type { ConversationStore } from '../server/claude/conversation-store.js';
 import { ClaudeSDKBridge } from './claude-sdk-bridge.js';
 import {
+  buildClaudeQuestionKeyboard,
   buildDeleteConfirmKeyboard,
   buildDirectoryPickerKeyboard,
   buildModeKeyboard,
   buildOptionKeyboard,
+  buildPlanApprovalKeyboard,
   buildSessionSwitcherKeyboard,
+  buildSettingsKeyboard,
 } from './keyboards.js';
 import { OutputFormatter } from './output-formatter.js';
 import {
@@ -26,7 +29,7 @@ import {
   resolveAndValidatePath,
 } from './path-utils.js';
 import { SessionManager } from './session-manager.js';
-import type { PermissionMode, VerbosityLevel } from './types.js';
+import type { ClaudeQuestion, PermissionMode, VerbosityLevel } from './types.js';
 import { VALID_PERMISSION_MODES, VALID_VERBOSITY_LEVELS } from './types.js';
 
 // Debug mode: set TELEGRAM_DEBUG=true or TELEGRAM_DEBUG=1 for verbose logging
@@ -82,6 +85,22 @@ export class TelegramBotService {
   // Directory picker state per user
   private activeDirectoryPickers = new Map<number, DirectoryPickerState>();
 
+  // Pending question answers (when user selects "Other")
+  private pendingQuestionAnswer = new Map<number, { questions: ClaudeQuestion[]; index: number }>();
+
+  // Track active questions for building answers
+  private activeQuestionSets = new Map<number, ClaudeQuestion[]>();
+
+  // Track collected answers for multi-question flows
+  private questionProgress = new Map<
+    number,
+    {
+      questions: ClaudeQuestion[];
+      currentIndex: number;
+      answers: string[];
+    }
+  >();
+
   // Reserved bot commands (handled locally, not forwarded to Claude)
   private readonly RESERVED_COMMANDS = new Set([
     'start',
@@ -98,6 +117,7 @@ export class TelegramBotService {
     'querystatus',
     'status',
     'verbosity',
+    'settings',
     '1',
     '2',
     '3',
@@ -160,6 +180,7 @@ export class TelegramBotService {
     this.bot.command('querystatus', (ctx) => this.handleQueryStatus(ctx));
     this.bot.command('status', (ctx) => this.handleStatus(ctx));
     this.bot.command('verbosity', (ctx) => this.handleVerbosity(ctx));
+    this.bot.command('settings', (ctx) => this.handleSettings(ctx));
 
     // Quick response commands
     for (const num of ['1', '2', '3', '4', '5', '6', '7', '8', '9']) {
@@ -257,6 +278,7 @@ Type /bothelp for all commands.
 /mode [mode] - Show or change permission mode
 /unsafe - Toggle dangerously-skip-permissions mode
 /verbosity [level] - Control output detail
+/settings - Manage default mode/directory
 
 *Quick Responses:*
 /1 - /9 - Send number to Claude
@@ -762,6 +784,95 @@ Everything else you type is sent to Claude as a prompt.
   }
 
   /**
+   * Handle /settings command - manage user-level preferences
+   */
+  private async handleSettings(ctx: Context): Promise<void> {
+    const userId = ctx.from?.id;
+    if (!userId || !this.isAuthorized(userId)) {
+      await ctx.reply('Not authorized');
+      return;
+    }
+
+    const args = ctx.message?.text?.split(' ').slice(1) || [];
+    const settings = this.sessionManager.getUserSettings(userId);
+
+    if (args.length === 0) {
+      // Show current settings with keyboard
+      const lines = [
+        '*⚙️ User Settings*',
+        '',
+        `*Default Mode:* ${settings.defaultMode}`,
+        `*Default Dir:* ${settings.defaultWorkingDir || '(server default)'}`,
+        '',
+        'These settings apply to *new sessions* you create.',
+        '',
+        'Usage:',
+        '`/settings mode <mode>` - Set default mode',
+        '`/settings dir <path>` - Set default directory',
+      ];
+
+      await ctx.reply(lines.join('\n'), {
+        parse_mode: 'Markdown',
+        reply_markup: buildSettingsKeyboard(settings.defaultMode),
+      });
+      return;
+    }
+
+    const subCommand = args[0].toLowerCase();
+
+    if (subCommand === 'mode') {
+      if (args.length < 2) {
+        await ctx.reply(
+          `Current default mode: *${settings.defaultMode}*\n\nValid modes: ${VALID_PERMISSION_MODES.join(', ')}`,
+          { parse_mode: 'Markdown' }
+        );
+        return;
+      }
+
+      const newMode = args[1] as PermissionMode;
+      if (!VALID_PERMISSION_MODES.includes(newMode)) {
+        await ctx.reply(`Invalid mode. Valid modes: ${VALID_PERMISSION_MODES.join(', ')}`);
+        return;
+      }
+
+      this.sessionManager.setDefaultMode(userId, newMode);
+      await ctx.reply(`✅ Default mode set to: *${newMode}*\n\nNew sessions will use this mode.`, {
+        parse_mode: 'Markdown',
+      });
+    } else if (subCommand === 'dir') {
+      if (args.length < 2) {
+        await ctx.reply(
+          `Current default directory: *${settings.defaultWorkingDir || '(server default)'}*`,
+          { parse_mode: 'Markdown' }
+        );
+        return;
+      }
+
+      const session = this.sessionManager.getActiveSession(userId);
+      const basePath = session?.workingDir || this.defaultWorkingDir;
+      const { resolveAndValidatePath } = await import('./path-utils.js');
+      const pathArg = args.slice(1).join(' ');
+      const validation = resolveAndValidatePath(pathArg, basePath);
+
+      if (!validation.valid) {
+        await ctx.reply(`❌ ${validation.error}`);
+        return;
+      }
+
+      this.sessionManager.setDefaultWorkingDir(userId, validation.resolved);
+      await ctx.reply(
+        `✅ Default directory set to:\n\`${validation.resolved}\`\n\nNew sessions will start in this directory.`,
+        { parse_mode: 'Markdown' }
+      );
+    } else {
+      await ctx.reply(
+        'Unknown settings command.\n\nUsage:\n`/settings mode <mode>`\n`/settings dir <path>`',
+        { parse_mode: 'Markdown' }
+      );
+    }
+  }
+
+  /**
    * Handle quick response commands (/1-/9, /y, /n)
    */
   private async handleQuickResponse(ctx: Context, response: string): Promise<void> {
@@ -868,6 +979,24 @@ Everything else you type is sent to Claude as a prompt.
       }
       return;
     }
+
+    // AskUserQuestion answer callbacks
+    if (data.startsWith('ask:')) {
+      await this.handleQuestionAnswerCallback(ctx, userId, data);
+      return;
+    }
+
+    // Plan approval callbacks
+    if (data.startsWith('plan:')) {
+      await this.handlePlanApprovalCallback(ctx, userId, data);
+      return;
+    }
+
+    // Settings callbacks
+    if (data.startsWith('settings:')) {
+      await this.handleSettingsCallback(ctx, userId, data);
+      return;
+    }
   }
 
   /**
@@ -943,6 +1072,188 @@ Everything else you type is sent to Claude as a prompt.
   }
 
   /**
+   * Handle question answer callbacks from AskUserQuestion
+   */
+  private async handleQuestionAnswerCallback(
+    ctx: Context,
+    userId: number,
+    data: string
+  ): Promise<void> {
+    // Format: ask:<questionIndex>:<label>
+    const parts = data.split(':');
+    if (parts.length < 3) return;
+
+    const questionIndex = Number.parseInt(parts[1], 10);
+    const label = parts.slice(2).join(':'); // Label might contain colons
+
+    const progress = this.questionProgress.get(userId);
+    if (!progress || questionIndex !== progress.currentIndex) {
+      await ctx.editMessageText('Question expired. Please try again.');
+      return;
+    }
+
+    const question = progress.questions[questionIndex];
+
+    if (label === '__other__') {
+      // User wants to type a custom answer
+      this.pendingQuestionAnswer.set(userId, {
+        questions: progress.questions,
+        index: questionIndex,
+      });
+      await ctx.editMessageText(
+        `*${question.header}*\n\n${question.question}\n\n_Type your answer:_`,
+        { parse_mode: 'Markdown' }
+      );
+      return;
+    }
+
+    // Record the answer and show confirmation
+    await ctx.editMessageText(`✅ Selected: *${label}*`, { parse_mode: 'Markdown' });
+    await this.recordAnswerAndContinue(ctx, userId, label);
+  }
+
+  /**
+   * Display a single question with progress indicator
+   */
+  private async displayQuestion(
+    ctx: Context,
+    question: ClaudeQuestion,
+    index: number,
+    total: number
+  ): Promise<void> {
+    const header = question.header ? `*${question.header}*\n\n` : '';
+    const progress = total > 1 ? ` (${index + 1}/${total})` : '';
+    const text = `❓${progress} ${header}${question.question}`;
+
+    let optionDetails = '';
+    if (question.options.some((opt) => opt.description)) {
+      optionDetails = `\n\n${question.options.map((opt) => `• *${opt.label}*: ${opt.description}`).join('\n')}`;
+    }
+
+    await ctx.reply(`${text}${optionDetails}`, {
+      parse_mode: 'Markdown',
+      reply_markup: buildClaudeQuestionKeyboard(question, index),
+    });
+  }
+
+  /**
+   * Record an answer and proceed to next question or send all answers to Claude
+   */
+  private async recordAnswerAndContinue(
+    ctx: Context,
+    userId: number,
+    answer: string
+  ): Promise<void> {
+    const progress = this.questionProgress.get(userId);
+    if (!progress) return;
+
+    // Store this answer
+    progress.answers.push(answer);
+    progress.currentIndex++;
+
+    // Check if there are more questions
+    if (progress.currentIndex < progress.questions.length) {
+      // Display next question
+      const nextQuestion = progress.questions[progress.currentIndex];
+      await this.displayQuestion(
+        ctx,
+        nextQuestion,
+        progress.currentIndex,
+        progress.questions.length
+      );
+    } else {
+      // All questions answered - send all answers to Claude
+      const formattedAnswers = this.formatAnswersForClaude(progress.questions, progress.answers);
+
+      // Cleanup state
+      this.questionProgress.delete(userId);
+      this.activeQuestionSets.delete(userId);
+      this.pendingQuestionAnswer.delete(userId);
+
+      // Forward all answers to Claude
+      await this.forwardToClaude(ctx, formattedAnswers);
+    }
+  }
+
+  /**
+   * Format collected answers as JSON for Claude
+   */
+  private formatAnswersForClaude(questions: ClaudeQuestion[], answers: string[]): string {
+    // Format as JSON object mapping headers to answers
+    const answerObj: Record<string, string> = {};
+    for (let i = 0; i < questions.length; i++) {
+      const key = questions[i].header || `question_${i + 1}`;
+      answerObj[key] = answers[i];
+    }
+    return JSON.stringify(answerObj);
+  }
+
+  /**
+   * Handle plan approval callbacks
+   */
+  private async handlePlanApprovalCallback(
+    ctx: Context,
+    userId: number,
+    data: string
+  ): Promise<void> {
+    const action = data.replace('plan:', '');
+    const session = this.sessionManager.getActiveSession(userId);
+
+    if (!session) {
+      await ctx.editMessageText('No active session.');
+      return;
+    }
+
+    if (action === 'implement') {
+      // Switch to bypassPermissions mode and keep context
+      this.sessionManager.setMode(userId, 'bypassPermissions');
+      await ctx.editMessageText(
+        `✅ Switched to *bypass* mode ${session.emoji}\n\nSend a prompt to start implementation.`,
+        { parse_mode: 'Markdown' }
+      );
+    } else if (action === 'clear_implement') {
+      // Switch mode AND clear Claude session for fresh start
+      this.sessionManager.setMode(userId, 'bypassPermissions');
+      this.sessionManager.setClaudeSessionId(userId, '');
+      await ctx.editMessageText(
+        `✅ Switched to *bypass* mode + cleared context ${session.emoji}\n\nSend a prompt to start fresh implementation.`,
+        { parse_mode: 'Markdown' }
+      );
+    } else if (action === 'cancel') {
+      await ctx.editMessageText(
+        `Staying in *plan* mode ${session.emoji}\n\nContinue refining the plan or use /mode to change.`,
+        { parse_mode: 'Markdown' }
+      );
+    }
+  }
+
+  /**
+   * Handle settings callbacks
+   */
+  private async handleSettingsCallback(ctx: Context, userId: number, data: string): Promise<void> {
+    // Format: settings:mode:<mode>
+    const parts = data.split(':');
+    if (parts.length < 3) return;
+
+    const settingType = parts[1];
+    const value = parts[2];
+
+    if (settingType === 'mode') {
+      const newMode = value as PermissionMode;
+      if (!VALID_PERMISSION_MODES.includes(newMode)) {
+        await ctx.editMessageText('Invalid mode.');
+        return;
+      }
+
+      this.sessionManager.setDefaultMode(userId, newMode);
+      await ctx.editMessageText(
+        `✅ Default mode set to: *${newMode}*\n\nNew sessions will use this mode.`,
+        { parse_mode: 'Markdown' }
+      );
+    }
+  }
+
+  /**
    * Handle general text messages
    */
   private async handleMessage(ctx: Context): Promise<void> {
@@ -974,9 +1285,17 @@ Everything else you type is sent to Claude as a prompt.
 
       // Unknown command - show error
       logger.log(`[handleMessage] Unknown command /${cmdLower}`);
-      await ctx.reply(
-        `❓ Unknown command: /${cmd}\n\nUse /bothelp to see available commands.`
-      );
+      await ctx.reply(`❓ Unknown command: /${cmd}\n\nUse /bothelp to see available commands.`);
+      return;
+    }
+
+    // Check for pending question answer (user typed "Other" for a question)
+    const pendingAnswer = this.pendingQuestionAnswer.get(userId);
+    if (pendingAnswer) {
+      this.pendingQuestionAnswer.delete(userId);
+      logger.log(`[handleMessage] Handling pending question answer: "${text}"`);
+      // Record typed answer and continue to next question or send all to Claude
+      await this.recordAnswerAndContinue(ctx, userId, text);
       return;
     }
 
@@ -1115,6 +1434,14 @@ Everything else you type is sent to Claude as a prompt.
               new InputFile(Buffer.from(action.content, 'utf-8'), action.fileName),
               { caption: action.caption }
             );
+
+            // If this is a plan file and we're in plan mode, show approval buttons
+            if (action.isPlan && session!.currentMode === 'plan') {
+              await ctx.reply('📋 *Plan ready for review*\n\nWhat would you like to do?', {
+                parse_mode: 'Markdown',
+                reply_markup: buildPlanApprovalKeyboard(),
+              });
+            }
           } catch (docError) {
             logger.error('Error sending document:', docError);
             // Fallback to sending as text (truncated if needed)
@@ -1123,6 +1450,22 @@ Everything else you type is sent to Claude as a prompt.
               `📋 ${action.fileName}:\n\n${preview}${action.content.length > 3500 ? '\n\n...(truncated)' : ''}`
             );
           }
+        } else if (action.type === 'user_question') {
+          // Handle Claude's AskUserQuestion tool - sequential question display
+          console.log(
+            `[telegram] Handling user_question with ${action.questions.length} question(s)`
+          );
+
+          // Initialize progress tracking
+          this.questionProgress.set(userId, {
+            questions: action.questions,
+            currentIndex: 0,
+            answers: [],
+          });
+          this.activeQuestionSets.set(userId, action.questions);
+
+          // Display only the first question
+          await this.displayQuestion(ctx, action.questions[0], 0, action.questions.length);
         }
       } catch (error) {
         logger.error('Error handling action:', error);
@@ -1330,6 +1673,7 @@ Everything else you type is sent to Claude as a prompt.
         { command: 'querystatus', description: 'Show active query status' },
         { command: 'mode', description: 'Show or change permission mode' },
         { command: 'verbosity', description: 'Control output detail level' },
+        { command: 'settings', description: 'Manage default mode/directory' },
         { command: 'bothelp', description: 'Show help message' },
       ]);
       logger.log('Registered bot commands with Telegram');

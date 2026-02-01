@@ -180,8 +180,9 @@ export class ClaudeInput extends LitElement {
   render() {
     return html`
       <div class="input-container">
-        ${this.showModeSelector
-          ? html`
+        ${
+          this.showModeSelector
+            ? html`
               <div class="mode-selector">
                 <button
                   class="mode-button ${this.mode === 'auto' ? 'active' : ''}"
@@ -199,7 +200,8 @@ export class ClaudeInput extends LitElement {
                 </button>
               </div>
             `
-          : ''}
+            : ''
+        }
         <textarea
           class="input-field"
           .value=${this.inputValue}
@@ -215,13 +217,15 @@ export class ClaudeInput extends LitElement {
           @click=${this.handleSend}
           title="Send message"
         >
-          ${this.loading
-            ? html`<span class="spinning">⏳</span>`
-            : html`
+          ${
+            this.loading
+              ? html`<span class="spinning">⏳</span>`
+              : html`
                 <svg viewBox="0 0 24 24" fill="currentColor">
                   <path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z" />
                 </svg>
-              `}
+              `
+          }
         </button>
       </div>
     `;

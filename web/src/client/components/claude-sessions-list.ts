@@ -268,16 +268,17 @@ export class ClaudeSessionsList extends LitElement {
           </button>
         </div>
 
-        ${this.sessions.length === 0
-          ? html`
+        ${
+          this.sessions.length === 0
+            ? html`
               <div class="empty-state">
                 <div class="empty-state-icon">💬</div>
                 <div class="empty-state-title">No Claude Sessions</div>
                 <div>Start a new session to chat with Claude</div>
               </div>
             `
-          : this.sessions.map(
-              (session) => html`
+            : this.sessions.map(
+                (session) => html`
                 <div
                   class="session-card ${this.selectedSessionId === session.id ? 'selected' : ''}"
                   @click=${() => this.handleSessionClick(session)}
@@ -286,12 +287,16 @@ export class ClaudeSessionsList extends LitElement {
                     <div class="session-id">${session.id.slice(0, 12)}...</div>
                     <div class="session-badges">
                       <span class="badge badge-mode">${session.currentMode}</span>
-                      ${session.telegramUserId
-                        ? html`<span class="badge badge-telegram">Telegram</span>`
-                        : ''}
-                      ${session.unsafeMode
-                        ? html`<span class="badge badge-unsafe">Unsafe</span>`
-                        : ''}
+                      ${
+                        session.telegramUserId
+                          ? html`<span class="badge badge-telegram">Telegram</span>`
+                          : ''
+                      }
+                      ${
+                        session.unsafeMode
+                          ? html`<span class="badge badge-unsafe">Unsafe</span>`
+                          : ''
+                      }
                     </div>
                   </div>
                   <div class="session-info">
@@ -310,7 +315,8 @@ export class ClaudeSessionsList extends LitElement {
                   </div>
                 </div>
               `
-            )}
+              )
+        }
       </div>
     `;
   }

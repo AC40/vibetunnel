@@ -178,10 +178,7 @@ export function createClaudeSessionRoutes(config: ClaudeSessionApiConfig): Route
       ) {
         conversationStore.updateToolUse(id, event.event.content_block.name || 'tool', 'running');
       }
-      if (
-        event.type === 'stream_event' &&
-        event.event.type === 'content_block_stop'
-      ) {
+      if (event.type === 'stream_event' && event.event.type === 'content_block_stop') {
         // Mark any running tools as complete
         const history = conversationStore.getHistory(id);
         const lastMsg = history[history.length - 1];

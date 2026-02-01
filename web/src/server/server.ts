@@ -1232,7 +1232,9 @@ export async function createApp(): Promise<AppInstance> {
     }
   } else if (config.enableTelegram && !config.telegramBotToken) {
     logger.error(
-      chalk.red('Telegram bot enabled but no token provided. Use --telegram-token or TELEGRAM_BOT_TOKEN')
+      chalk.red(
+        'Telegram bot enabled but no token provided. Use --telegram-token or TELEGRAM_BOT_TOKEN'
+      )
     );
   }
 

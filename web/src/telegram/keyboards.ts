@@ -5,7 +5,7 @@
  */
 
 import { InlineKeyboard } from 'grammy';
-import type { InteractiveOption } from './types.js';
+import type { ClaudeQuestion, InteractiveOption, PermissionMode } from './types.js';
 
 /**
  * Build an inline keyboard from detected options
@@ -146,4 +146,63 @@ export function buildDeleteConfirmKeyboard(sessionName: string): InlineKeyboard 
   return new InlineKeyboard()
     .text('🗑️ Yes, delete', `delete:confirm:${sessionName}`)
     .text('❌ Cancel', 'delete:cancel');
+}
+
+/**
+ * Build keyboard for Claude's AskUserQuestion tool
+ * Each option becomes a button that sends the answer back to Claude
+ */
+export function buildClaudeQuestionKeyboard(
+  question: ClaudeQuestion,
+  questionIndex: number
+): InlineKeyboard {
+  const keyboard = new InlineKeyboard();
+
+  for (const opt of question.options) {
+    // Truncate label if too long for button
+    const label = opt.label.length > 40 ? `${opt.label.slice(0, 37)}...` : opt.label;
+    // Encode question index and option label in callback data
+    keyboard.text(label, `ask:${questionIndex}:${opt.label}`).row();
+  }
+
+  // Add "Other" option for free text answer
+  keyboard.text('✏️ Other (type answer)', `ask:${questionIndex}:__other__`);
+
+  return keyboard;
+}
+
+/**
+ * Build keyboard for plan approval workflow
+ * Shows after a plan file is written in plan mode
+ */
+export function buildPlanApprovalKeyboard(): InlineKeyboard {
+  return new InlineKeyboard()
+    .text('✅ Implement', 'plan:implement')
+    .row()
+    .text('🔄 Clear & Implement', 'plan:clear_implement')
+    .row()
+    .text('❌ Stay in Plan Mode', 'plan:cancel');
+}
+
+/**
+ * Build keyboard for user settings
+ */
+export function buildSettingsKeyboard(currentMode: PermissionMode): InlineKeyboard {
+  const keyboard = new InlineKeyboard();
+
+  const modes: Array<{ value: PermissionMode; label: string }> = [
+    { value: 'default', label: '👋 Default' },
+    { value: 'acceptEdits', label: '✏️ Accept Edits' },
+    { value: 'plan', label: '📝 Plan' },
+    { value: 'dontAsk', label: "🚀 Don't Ask" },
+    { value: 'bypassPermissions', label: '⚠️ Bypass' },
+  ];
+
+  for (const mode of modes) {
+    const isCurrent = mode.value === currentMode;
+    const indicator = isCurrent ? ' ✓' : '';
+    keyboard.text(`${mode.label}${indicator}`, `settings:mode:${mode.value}`).row();
+  }
+
+  return keyboard;
 }

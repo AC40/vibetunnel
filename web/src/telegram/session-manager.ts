@@ -6,8 +6,14 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
-import type { PermissionMode, UserProfile, UserSession, VerbosityLevel } from './types.js';
-import { DEFAULT_MAX_SESSIONS, SESSION_EMOJIS } from './types.js';
+import type {
+  PermissionMode,
+  UserProfile,
+  UserSession,
+  UserSettings,
+  VerbosityLevel,
+} from './types.js';
+import { DEFAULT_MAX_SESSIONS, DEFAULT_USER_SETTINGS, SESSION_EMOJIS } from './types.js';
 
 interface SerializedSession {
   id: string;
@@ -23,10 +29,16 @@ interface SerializedSession {
   lastActivity: string;
 }
 
+interface SerializedSettings {
+  defaultMode: PermissionMode;
+  defaultWorkingDir?: string;
+}
+
 interface SerializedProfile {
   telegramUserId: number;
   sessions: SerializedSession[];
   activeSessionId: string;
+  settings?: SerializedSettings;
 }
 
 export class SessionManager {
@@ -53,8 +65,13 @@ export class SessionManager {
         telegramUserId: userId,
         sessions: [],
         activeSessionId: '',
+        settings: { ...DEFAULT_USER_SETTINGS },
       };
       this.profiles.set(userId, profile);
+    }
+    // Migration: add settings if missing from existing profile
+    if (!profile.settings) {
+      profile.settings = { ...DEFAULT_USER_SETTINGS };
     }
     return profile;
   }
@@ -132,8 +149,8 @@ export class SessionManager {
       };
     }
 
-    // Auto-generate name from directory if not provided
-    const resolvedDir = workingDir || this.defaultWorkingDir;
+    // Use user's default working dir if set, otherwise fall back to server default
+    const resolvedDir = workingDir || profile.settings?.defaultWorkingDir || this.defaultWorkingDir;
     const sessionName = name || path.basename(resolvedDir);
 
     // Check for duplicate name
@@ -141,13 +158,16 @@ export class SessionManager {
       return { error: `Session "${sessionName}" already exists. Choose a different name.` };
     }
 
+    // Use user's default mode for new sessions
+    const defaultMode = profile.settings?.defaultMode || 'default';
+
     const session: UserSession = {
       id: this.generateSessionId(),
       name: sessionName,
       emoji: this.assignSessionEmoji(profile),
       telegramUserId: userId,
       claudeSessionId: '',
-      currentMode: 'default',
+      currentMode: defaultMode,
       workingDir: resolvedDir,
       unsafeMode: false,
       verbosity: 'normal',
@@ -324,6 +344,37 @@ export class SessionManager {
   }
 
   /**
+   * Get user settings
+   */
+  getUserSettings(userId: number): UserSettings {
+    const profile = this.getOrCreateProfile(userId);
+    return profile.settings || { ...DEFAULT_USER_SETTINGS };
+  }
+
+  /**
+   * Update user settings
+   */
+  setUserSettings(userId: number, updates: Partial<UserSettings>): void {
+    const profile = this.getOrCreateProfile(userId);
+    profile.settings = { ...profile.settings, ...updates };
+    this.saveToDisk();
+  }
+
+  /**
+   * Set the default mode for new sessions
+   */
+  setDefaultMode(userId: number, mode: PermissionMode): void {
+    this.setUserSettings(userId, { defaultMode: mode });
+  }
+
+  /**
+   * Set the default working directory for new sessions
+   */
+  setDefaultWorkingDir(userId: number, dir: string): void {
+    this.setUserSettings(userId, { defaultWorkingDir: dir });
+  }
+
+  /**
    * Load profiles from disk
    */
   private loadFromDisk(): void {
@@ -358,6 +409,7 @@ export class SessionManager {
               lastActivity: new Date(s.lastActivity),
             })),
             activeSessionId: p.activeSessionId,
+            settings: p.settings ?? { ...DEFAULT_USER_SETTINGS },
           };
           this.profiles.set(p.telegramUserId, profile);
         }
@@ -405,6 +457,7 @@ export class SessionManager {
         telegramUserId: s.telegramUserId,
         sessions: [session],
         activeSessionId: sessionId,
+        settings: { ...DEFAULT_USER_SETTINGS },
       };
 
       this.profiles.set(s.telegramUserId, profile);
@@ -433,6 +486,7 @@ export class SessionManager {
         lastActivity: s.lastActivity.toISOString(),
       })),
       activeSessionId: p.activeSessionId,
+      settings: p.settings,
     }));
     const data = JSON.stringify(profiles, null, 2);
     fs.writeFileSync(this.storePath, data);

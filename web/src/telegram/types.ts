@@ -64,12 +64,28 @@ export interface UserSession {
 }
 
 /**
+ * User-level settings for defaults
+ */
+export interface UserSettings {
+  defaultMode: PermissionMode;
+  defaultWorkingDir?: string;
+}
+
+/**
+ * Default user settings
+ */
+export const DEFAULT_USER_SETTINGS: UserSettings = {
+  defaultMode: 'default',
+};
+
+/**
  * User profile containing multiple named sessions
  */
 export interface UserProfile {
   telegramUserId: number;
   sessions: UserSession[];
   activeSessionId: string; // ID of the currently active session
+  settings: UserSettings; // User-level settings for defaults
 }
 
 /**
@@ -112,6 +128,16 @@ export interface InteractiveOption {
 }
 
 /**
+ * Claude's AskUserQuestion structure
+ */
+export interface ClaudeQuestion {
+  question: string;
+  header: string;
+  options: Array<{ label: string; description: string }>;
+  multiSelect: boolean;
+}
+
+/**
  * Actions to perform on Telegram
  */
 export type TelegramAction =
@@ -125,7 +151,8 @@ export type TelegramAction =
   | { type: 'status'; text: string }
   | { type: 'clear_status' }
   | { type: 'notification'; text: string }
-  | { type: 'document'; content: string; fileName: string; caption?: string };
+  | { type: 'document'; content: string; fileName: string; caption?: string; isPlan?: boolean }
+  | { type: 'user_question'; questions: ClaudeQuestion[] };
 
 /**
  * SDK Event types from Claude Code's stream-json output

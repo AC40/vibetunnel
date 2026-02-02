@@ -55,8 +55,8 @@ export class ClaudeSDKBridge extends EventEmitter {
       stdio: ['pipe', 'pipe', 'pipe'],
     });
 
-    // Close stdin immediately to signal EOF - prevents Claude CLI from waiting for more input
-    this.process.stdin?.end();
+    // Keep stdin open to respond to permission prompts (e.g., AskUserQuestion)
+    // stdin will be closed when the process exits
 
     const pid = this.process.pid;
     logger.log(`Claude process spawned, pid=${pid}`);
@@ -110,10 +110,19 @@ export class ClaudeSDKBridge extends EventEmitter {
       });
     }
 
-    // Capture stderr for error messages
+    // Capture stderr for error messages and handle permission prompts
     if (this.process.stderr) {
       this.process.stderr.on('data', (data: Buffer) => {
         const errorText = data.toString();
+
+        // Auto-approve AskUserQuestion permission prompt
+        // Claude CLI asks "Answer questions?" when this tool is used
+        if (errorText.includes('Answer questions?') || errorText.includes('AskUserQuestion')) {
+          logger.log('Auto-approving AskUserQuestion permission prompt');
+          this.process?.stdin?.write('y\n');
+          return; // Don't emit this as an error
+        }
+
         this.emit('error', errorText);
       });
     }
@@ -129,6 +138,12 @@ export class ClaudeSDKBridge extends EventEmitter {
         logger.log(
           `Claude process exited, code=${code}, session=${capturedSessionId || 'none'}, elapsed=${elapsed}s`
         );
+
+        // Clean up stdin if still open
+        if (this.process?.stdin && !this.process.stdin.destroyed) {
+          this.process.stdin.end();
+        }
+
         this.emit('exit', code);
         this.process = null;
 

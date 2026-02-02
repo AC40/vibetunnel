@@ -148,6 +148,8 @@ interface Config {
   telegramBotToken: string | null;
   telegramUsers: number[];
   telegramAllowUnsafe: boolean;
+  // DeepGram API key for voice transcription
+  deepgramApiKey: string | null;
 }
 
 // Show help message
@@ -192,6 +194,7 @@ Telegram Bot Options:
   --telegram-token <t>  Telegram bot token (or TELEGRAM_BOT_TOKEN env var)
   --telegram-users <ids> Comma-separated allowed user IDs (auto-whitelist first user if empty)
   --telegram-unsafe     Allow users to enable dangerously-skip-permissions mode
+  --deepgram-key <key>  DeepGram API key for voice transcription (or DEEPGRAM_API_KEY env var)
 
 HQ Mode Options:
   --hq                  Run as HQ (headquarters) server
@@ -212,6 +215,7 @@ Environment Variables:
   PUSH_CONTACT_EMAIL    Contact email for VAPID configuration
   NGROK_AUTHTOKEN       Ngrok auth token (used with --ngrok)
   TELEGRAM_BOT_TOKEN    Telegram bot token (used with --telegram)
+  DEEPGRAM_API_KEY      DeepGram API key for voice transcription
 
 Examples:
   # Run a simple server with authentication
@@ -284,6 +288,8 @@ function parseArgs(): Config {
     telegramBotToken: (process.env.TELEGRAM_BOT_TOKEN?.trim() || null) as string | null,
     telegramUsers: [] as number[],
     telegramAllowUnsafe: false,
+    // DeepGram API key for voice transcription
+    deepgramApiKey: (process.env.DEEPGRAM_API_KEY?.trim() || null) as string | null,
   };
 
   // Check for help flag first
@@ -383,6 +389,9 @@ function parseArgs(): Config {
       i++;
     } else if (args[i] === '--telegram-unsafe') {
       config.telegramAllowUnsafe = true;
+    } else if (args[i] === '--deepgram-key' && i + 1 < args.length) {
+      config.deepgramApiKey = args[i + 1];
+      i++;
     } else if (args[i].startsWith('--')) {
       // Unknown argument
       logger.error(`Unknown argument: ${args[i]}`);
@@ -1217,6 +1226,7 @@ export async function createApp(): Promise<AppInstance> {
         allowUnsafeMode: config.telegramAllowUnsafe,
         controlDir: CONTROL_DIR,
         conversationStore,
+        deepgramApiKey: config.deepgramApiKey ?? undefined,
       });
       // Don't await start here - it blocks. Start in background.
       telegramBot

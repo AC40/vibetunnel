@@ -10,7 +10,6 @@ export { detectInteractiveOptions } from './option-detector.js';
 export { OutputFormatter } from './output-formatter.js';
 export { SessionManager } from './session-manager.js';
 export { TelegramBotService } from './telegram-bot-service.js';
-
 // Re-export types
 export type {
   ClaudeQueryParams,
@@ -24,3 +23,8 @@ export type {
   TelegramConfig,
   UserSession,
 } from './types.js';
+export type {
+  TranscriptionResult,
+  VoiceTranscriptionConfig,
+} from './voice-transcription.js';
+export { VoiceTranscriptionService } from './voice-transcription.js';

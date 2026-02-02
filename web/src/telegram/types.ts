@@ -114,6 +114,12 @@ export interface TelegramConfig {
   allowUnsafeMode?: boolean;
   defaultWorkingDir?: string; // Configurable base directory for new sessions
   maxSessionsPerUser?: number; // Maximum sessions per user (default: 5)
+  /** DeepGram API key for voice message transcription */
+  deepgramApiKey?: string;
+  /** DeepGram model to use for transcription (default: 'nova-2') */
+  deepgramModel?: string;
+  /** Language code for transcription (default: 'en') */
+  deepgramLanguage?: string;
 }
 
 /**

@@ -43,6 +43,7 @@ import {
   VALID_PERMISSION_MODES,
   VALID_VERBOSITY_LEVELS,
 } from './types.js';
+import { VoiceTranscriptionService } from './voice-transcription.js';
 
 // Debug mode: set TELEGRAM_DEBUG=true or TELEGRAM_DEBUG=1 for verbose logging
 const isDebug = process.env.TELEGRAM_DEBUG === 'true' || process.env.TELEGRAM_DEBUG === '1';
@@ -65,6 +66,12 @@ export interface TelegramBotServiceConfig {
   conversationStore?: ConversationStore;
   defaultWorkingDir?: string;
   maxSessionsPerUser?: number;
+  /** DeepGram API key for voice message transcription */
+  deepgramApiKey?: string;
+  /** DeepGram model to use for transcription (default: 'nova-2') */
+  deepgramModel?: string;
+  /** Language code for transcription (default: 'en') */
+  deepgramLanguage?: string;
 }
 
 interface ActiveQuery {
@@ -88,6 +95,7 @@ export class TelegramBotService {
   private allowedUsers: Set<number>;
   private allowUnsafeMode: boolean;
   private defaultWorkingDir: string;
+  private voiceTranscriptionService?: VoiceTranscriptionService;
 
   // Per-session bridges and formatters (keyed by session.id)
   private activeBridges = new Map<string, ClaudeSDKBridge>();
@@ -155,6 +163,16 @@ export class TelegramBotService {
     this.allowedUsers = new Set(config.allowedUsers || []);
     this.allowUnsafeMode = config.allowUnsafeMode ?? false;
 
+    // Initialize voice transcription if DeepGram API key is provided
+    if (config.deepgramApiKey) {
+      this.voiceTranscriptionService = new VoiceTranscriptionService({
+        deepgramApiKey: config.deepgramApiKey,
+        model: config.deepgramModel,
+        language: config.deepgramLanguage,
+      });
+      logger.log('Voice transcription enabled with DeepGram');
+    }
+
     this.setupHandlers();
   }
 
@@ -205,6 +223,9 @@ export class TelegramBotService {
 
     // Callback query handler for inline keyboards
     this.bot.on('callback_query:data', (ctx) => this.handleCallbackQuery(ctx));
+
+    // Voice message handler
+    this.bot.on('message:voice', (ctx) => this.handleVoiceMessage(ctx));
 
     // General message handler
     this.bot.on('message:text', (ctx) => this.handleMessage(ctx));
@@ -1425,6 +1446,87 @@ Everything else you type is sent to Claude as a prompt.
     logger.log('[handleMessage] Forwarding to Claude...');
     await this.forwardToClaude(ctx, text);
     logger.log('[handleMessage] Done forwarding to Claude');
+  }
+
+  /**
+   * Handle incoming voice messages
+   * Transcribes the audio using DeepGram and forwards the text to Claude
+   */
+  private async handleVoiceMessage(ctx: Context): Promise<void> {
+    const userId = ctx.from?.id;
+    const voice = ctx.message?.voice;
+    logger.log(`[handleVoiceMessage] userId=${userId}, voice duration=${voice?.duration}s`);
+
+    if (!userId || !voice) {
+      logger.log('[handleVoiceMessage] No userId or voice, returning');
+      return;
+    }
+
+    if (!this.isAuthorized(userId)) {
+      logger.log('[handleVoiceMessage] User not authorized');
+      await ctx.reply('You are not authorized. Send /start to request access.');
+      return;
+    }
+
+    // Check if voice transcription is configured
+    if (!this.voiceTranscriptionService?.isConfigured()) {
+      await ctx.reply(
+        '🎤 Voice messages are not supported.\n\n' +
+          'Voice transcription requires a DeepGram API key to be configured.'
+      );
+      return;
+    }
+
+    // Show typing indicator while processing
+    await ctx.replyWithChatAction('typing');
+
+    try {
+      // Get the file from Telegram
+      const file = await ctx.api.getFile(voice.file_id);
+      const fileUrl = `https://api.telegram.org/file/bot${this.bot.token}/${file.file_path}`;
+
+      logger.log(`[handleVoiceMessage] Transcribing voice file: ${file.file_path}`);
+
+      // Send a status message
+      const statusMsg = await ctx.reply('🎤 Transcribing voice message...');
+
+      // Transcribe the audio
+      const result = await this.voiceTranscriptionService.transcribeFromUrl(fileUrl);
+
+      // Delete the status message
+      try {
+        if (ctx.chat?.id) {
+          await ctx.api.deleteMessage(ctx.chat.id, statusMsg.message_id);
+        }
+      } catch (_e) {
+        // Ignore if already deleted
+      }
+
+      if (!result.text || result.text.trim() === '') {
+        await ctx.reply(
+          '🎤 Could not transcribe the voice message. Please try again or send text.'
+        );
+        return;
+      }
+
+      // Show the transcription to the user
+      const session = this.sessionManager.getActiveSession(userId);
+      const emoji = session?.emoji ?? '';
+      const durationText = result.duration ? ` (${result.duration.toFixed(1)}s)` : '';
+      await ctx.reply(`🎤 *Transcribed${durationText}:*\n\n${result.text} ${emoji}`, {
+        parse_mode: 'Markdown',
+      });
+
+      logger.log(`[handleVoiceMessage] Transcription: "${result.text.slice(0, 100)}..."`);
+
+      // Forward the transcribed text to Claude
+      await this.forwardToClaude(ctx, result.text);
+    } catch (error) {
+      logger.error('[handleVoiceMessage] Error:', error);
+      await ctx.reply(
+        `❌ Failed to transcribe voice message: ${error instanceof Error ? error.message : 'Unknown error'}`
+      );
+    }
   }
 
   /**

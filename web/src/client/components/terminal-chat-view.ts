@@ -386,7 +386,6 @@ export class TerminalChatView extends LitElement {
   @query('.chat-messages-container')
   private messagesContainer!: HTMLElement;
 
-  // biome-ignore lint/correctness/noUnusedPrivateClassMembers: Used in addMessage()
   private messageIdCounter = 0;
 
   connectedCallback() {

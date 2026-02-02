@@ -5,11 +5,11 @@
  */
 
 import { Router } from 'express';
-import type { ClaudeSessionInfo, PermissionMode } from '../../telegram/types.js';
 import { ClaudeSDKBridge } from '../../telegram/claude-sdk-bridge.js';
 import { OutputFormatter } from '../../telegram/output-formatter.js';
-import type { ConversationStore } from './conversation-store.js';
 import type { SessionManager } from '../../telegram/session-manager.js';
+import type { ClaudeSessionInfo, PermissionMode } from '../../telegram/types.js';
+import type { ConversationStore } from './conversation-store.js';
 
 export interface ClaudeSessionApiConfig {
   conversationStore: ConversationStore;

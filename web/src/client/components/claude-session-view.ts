@@ -6,8 +6,8 @@
 
 import { css, html, LitElement } from 'lit';
 import { customElement, property, query, state } from 'lit/decorators.js';
-import { createLogger } from '../utils/logger.js';
 import { authClient } from '../services/auth-client.js';
+import { createLogger } from '../utils/logger.js';
 import './claude-message.js';
 import './claude-input.js';
 
@@ -260,7 +260,7 @@ export class ClaudeSessionView extends LitElement {
   private handleWebSocketMessage(data: { type: string; message?: ConversationMessage }): void {
     if (data.type === 'message' && data.message) {
       // Update or add message
-      const existingIndex = this.messages.findIndex((m) => m.id === data.message!.id);
+      const existingIndex = this.messages.findIndex((m) => m.id === data.message?.id);
       if (existingIndex >= 0) {
         this.messages = [
           ...this.messages.slice(0, existingIndex),

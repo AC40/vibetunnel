@@ -7,6 +7,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import type {
+  NotificationMode,
   PermissionMode,
   UserProfile,
   UserSession,
@@ -25,6 +26,7 @@ interface SerializedSession {
   workingDir: string;
   unsafeMode: boolean;
   verbosity?: VerbosityLevel;
+  notificationMode?: NotificationMode;
   createdAt: string;
   lastActivity: string;
 }
@@ -32,6 +34,7 @@ interface SerializedSession {
 interface SerializedSettings {
   defaultMode: PermissionMode;
   defaultWorkingDir?: string;
+  defaultNotificationMode?: NotificationMode;
 }
 
 interface SerializedProfile {
@@ -160,6 +163,7 @@ export class SessionManager {
 
     // Use user's default mode for new sessions
     const defaultMode = profile.settings?.defaultMode || 'default';
+    const defaultNotificationMode = profile.settings?.defaultNotificationMode || 'default';
 
     const session: UserSession = {
       id: this.generateSessionId(),
@@ -171,6 +175,7 @@ export class SessionManager {
       workingDir: resolvedDir,
       unsafeMode: false,
       verbosity: 'normal',
+      notificationMode: defaultNotificationMode,
       createdAt: new Date(),
       lastActivity: new Date(),
     };
@@ -344,6 +349,13 @@ export class SessionManager {
   }
 
   /**
+   * Change the notification mode for active session
+   */
+  setNotificationMode(userId: number, notificationMode: NotificationMode): void {
+    this.updateActiveSession(userId, { notificationMode });
+  }
+
+  /**
    * Get user settings
    */
   getUserSettings(userId: number): UserSettings {
@@ -372,6 +384,13 @@ export class SessionManager {
    */
   setDefaultWorkingDir(userId: number, dir: string): void {
     this.setUserSettings(userId, { defaultWorkingDir: dir });
+  }
+
+  /**
+   * Set the default notification mode for new sessions
+   */
+  setDefaultNotificationMode(userId: number, mode: NotificationMode): void {
+    this.setUserSettings(userId, { defaultNotificationMode: mode });
   }
 
   /**
@@ -405,6 +424,7 @@ export class SessionManager {
               workingDir: s.workingDir,
               unsafeMode: s.unsafeMode ?? false,
               verbosity: s.verbosity ?? 'normal',
+              notificationMode: s.notificationMode ?? 'default',
               createdAt: new Date(s.createdAt),
               lastActivity: new Date(s.lastActivity),
             })),
@@ -449,6 +469,7 @@ export class SessionManager {
         workingDir: s.workingDir,
         unsafeMode: s.unsafeMode ?? false,
         verbosity: s.verbosity ?? 'normal',
+        notificationMode: 'default',
         createdAt: new Date(s.createdAt),
         lastActivity: new Date(s.lastActivity),
       };
@@ -482,6 +503,7 @@ export class SessionManager {
         workingDir: s.workingDir,
         unsafeMode: s.unsafeMode,
         verbosity: s.verbosity,
+        notificationMode: s.notificationMode,
         createdAt: s.createdAt.toISOString(),
         lastActivity: s.lastActivity.toISOString(),
       })),

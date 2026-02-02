@@ -5,7 +5,12 @@
  */
 
 import { InlineKeyboard } from 'grammy';
-import type { ClaudeQuestion, InteractiveOption, PermissionMode } from './types.js';
+import type {
+  ClaudeQuestion,
+  InteractiveOption,
+  NotificationMode,
+  PermissionMode,
+} from './types.js';
 
 /**
  * Build an inline keyboard from detected options
@@ -202,6 +207,27 @@ export function buildSettingsKeyboard(currentMode: PermissionMode): InlineKeyboa
     const isCurrent = mode.value === currentMode;
     const indicator = isCurrent ? ' ✓' : '';
     keyboard.text(`${mode.label}${indicator}`, `settings:mode:${mode.value}`).row();
+  }
+
+  return keyboard;
+}
+
+/**
+ * Build keyboard for notification mode selection
+ */
+export function buildNotificationModeKeyboard(currentMode: NotificationMode): InlineKeyboard {
+  const keyboard = new InlineKeyboard();
+
+  const modes: Array<{ value: NotificationMode; label: string; description: string }> = [
+    { value: 'default', label: '🔔 Default', description: 'Completion sounds only' },
+    { value: 'full', label: '🔊 Full', description: 'All messages with sound' },
+    { value: 'silent', label: '🔇 Silent', description: 'All messages silent' },
+  ];
+
+  for (const mode of modes) {
+    const isCurrent = mode.value === currentMode;
+    const indicator = isCurrent ? ' ✓' : '';
+    keyboard.text(`${mode.label}${indicator}`, `notif:${mode.value}`).row();
   }
 
   return keyboard;

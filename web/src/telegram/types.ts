@@ -36,6 +36,19 @@ export type VerbosityLevel = 'minimal' | 'normal' | 'verbose';
 export const VALID_VERBOSITY_LEVELS: VerbosityLevel[] = ['minimal', 'normal', 'verbose'];
 
 /**
+ * Notification modes for Telegram message sounds
+ * - 'default': Only completion notification is loud; all others silent
+ * - 'full': All messages sent with sound
+ * - 'silent': All messages sent silently
+ */
+export type NotificationMode = 'default' | 'full' | 'silent';
+
+/**
+ * All valid notification modes for validation
+ */
+export const VALID_NOTIFICATION_MODES: NotificationMode[] = ['default', 'full', 'silent'];
+
+/**
  * Animal emojis for session identification
  * Each session gets a unique emoji for visual distinction
  */
@@ -59,6 +72,7 @@ export interface UserSession {
   workingDir: string;
   unsafeMode: boolean;
   verbosity: VerbosityLevel;
+  notificationMode: NotificationMode;
   createdAt: Date;
   lastActivity: Date;
 }
@@ -69,6 +83,7 @@ export interface UserSession {
 export interface UserSettings {
   defaultMode: PermissionMode;
   defaultWorkingDir?: string;
+  defaultNotificationMode?: NotificationMode;
 }
 
 /**
@@ -76,6 +91,7 @@ export interface UserSettings {
  */
 export const DEFAULT_USER_SETTINGS: UserSettings = {
   defaultMode: 'default',
+  defaultNotificationMode: 'default',
 };
 
 /**

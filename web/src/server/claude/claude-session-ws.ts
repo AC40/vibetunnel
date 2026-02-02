@@ -91,7 +91,7 @@ export class ClaudeSessionWsHandler {
    */
   private handleClientMessage(
     _ws: WebSocket,
-    sessionId: string,
+    _sessionId: string,
     message: { type: string; [key: string]: unknown }
   ): void {
     switch (message.type) {

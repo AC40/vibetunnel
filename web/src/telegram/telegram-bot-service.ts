@@ -15,6 +15,7 @@ import {
   buildDeleteConfirmKeyboard,
   buildDirectoryPickerKeyboard,
   buildModeKeyboard,
+  buildNotificationModeKeyboard,
   buildOptionKeyboard,
   buildPlanApprovalKeyboard,
   buildSessionSwitcherKeyboard,
@@ -29,8 +30,19 @@ import {
   resolveAndValidatePath,
 } from './path-utils.js';
 import { SessionManager } from './session-manager.js';
-import type { ClaudeQuestion, PermissionMode, VerbosityLevel } from './types.js';
-import { VALID_PERMISSION_MODES, VALID_VERBOSITY_LEVELS } from './types.js';
+import type {
+  ClaudeQuestion,
+  NotificationMode,
+  PermissionMode,
+  TelegramAction,
+  UserSession,
+  VerbosityLevel,
+} from './types.js';
+import {
+  VALID_NOTIFICATION_MODES,
+  VALID_PERMISSION_MODES,
+  VALID_VERBOSITY_LEVELS,
+} from './types.js';
 
 // Debug mode: set TELEGRAM_DEBUG=true or TELEGRAM_DEBUG=1 for verbose logging
 const isDebug = process.env.TELEGRAM_DEBUG === 'true' || process.env.TELEGRAM_DEBUG === '1';
@@ -117,6 +129,7 @@ export class TelegramBotService {
     'querystatus',
     'status',
     'verbosity',
+    'notifications',
     'settings',
     '1',
     '2',
@@ -180,6 +193,7 @@ export class TelegramBotService {
     this.bot.command('querystatus', (ctx) => this.handleQueryStatus(ctx));
     this.bot.command('status', (ctx) => this.handleStatus(ctx));
     this.bot.command('verbosity', (ctx) => this.handleVerbosity(ctx));
+    this.bot.command('notifications', (ctx) => this.handleNotifications(ctx));
     this.bot.command('settings', (ctx) => this.handleSettings(ctx));
 
     // Quick response commands
@@ -278,6 +292,7 @@ Type /bothelp for all commands.
 /mode [mode] - Show or change permission mode
 /unsafe - Toggle dangerously-skip-permissions mode
 /verbosity [level] - Control output detail
+/notifications [mode] - Control notification sounds
 /settings - Manage default mode/directory
 
 *Quick Responses:*
@@ -784,6 +799,58 @@ Everything else you type is sent to Claude as a prompt.
   }
 
   /**
+   * Handle /notifications command - control message notification sounds
+   */
+  private async handleNotifications(ctx: Context): Promise<void> {
+    const userId = ctx.from?.id;
+    if (!userId || !this.isAuthorized(userId)) {
+      await ctx.reply('Not authorized');
+      return;
+    }
+
+    const session = this.sessionManager.getActiveSession(userId);
+    if (!session) {
+      await ctx.reply('No active session. Use /new to start one.');
+      return;
+    }
+
+    const args = ctx.message?.text?.split(' ').slice(1) || [];
+
+    if (args.length === 0) {
+      // Show current notification mode with keyboard
+      const modes = VALID_NOTIFICATION_MODES.map((mode) => {
+        const current = session.notificationMode === mode ? ' ✓' : '';
+        const desc = {
+          default: 'Only completion sounds',
+          full: 'All messages with sound',
+          silent: 'All messages silent',
+        }[mode];
+        return `• *${mode}*${current}: ${desc}`;
+      }).join('\n');
+
+      await ctx.reply(
+        `*🔔 Notification Mode* ${session.emoji}\n\nCurrent: *${session.notificationMode}*\n\n${modes}`,
+        {
+          parse_mode: 'Markdown',
+          reply_markup: buildNotificationModeKeyboard(session.notificationMode),
+        }
+      );
+      return;
+    }
+
+    const newMode = args[0].toLowerCase() as NotificationMode;
+    if (!VALID_NOTIFICATION_MODES.includes(newMode)) {
+      await ctx.reply(`Invalid mode. Valid modes: ${VALID_NOTIFICATION_MODES.join(', ')}`);
+      return;
+    }
+
+    this.sessionManager.setNotificationMode(userId, newMode);
+    await ctx.reply(`Notification mode set to: *${newMode}* ${session.emoji}`, {
+      parse_mode: 'Markdown',
+    });
+  }
+
+  /**
    * Handle /settings command - manage user-level preferences
    */
   private async handleSettings(ctx: Context): Promise<void> {
@@ -997,6 +1064,12 @@ Everything else you type is sent to Claude as a prompt.
       await this.handleSettingsCallback(ctx, userId, data);
       return;
     }
+
+    // Notification mode callbacks
+    if (data.startsWith('notif:')) {
+      await this.handleNotificationModeCallback(ctx, userId, data);
+      return;
+    }
   }
 
   /**
@@ -1119,7 +1192,8 @@ Everything else you type is sent to Claude as a prompt.
     ctx: Context,
     question: ClaudeQuestion,
     index: number,
-    total: number
+    total: number,
+    session?: UserSession
   ): Promise<void> {
     const header = question.header ? `*${question.header}*\n\n` : '';
     const progress = total > 1 ? ` (${index + 1}/${total})` : '';
@@ -1130,9 +1204,11 @@ Everything else you type is sent to Claude as a prompt.
       optionDetails = `\n\n${question.options.map((opt) => `• *${opt.label}*: ${opt.description}`).join('\n')}`;
     }
 
+    const shouldSilence = this.shouldSilenceNotification(session, 'user_question');
     await ctx.reply(`${text}${optionDetails}`, {
       parse_mode: 'Markdown',
       reply_markup: buildClaudeQuestionKeyboard(question, index),
+      disable_notification: shouldSilence,
     });
   }
 
@@ -1251,6 +1327,43 @@ Everything else you type is sent to Claude as a prompt.
         { parse_mode: 'Markdown' }
       );
     }
+  }
+
+  /**
+   * Handle notification mode callbacks
+   */
+  private async handleNotificationModeCallback(
+    ctx: Context,
+    userId: number,
+    data: string
+  ): Promise<void> {
+    // Format: notif:<mode>
+    const mode = data.replace('notif:', '') as NotificationMode;
+    if (!VALID_NOTIFICATION_MODES.includes(mode)) {
+      await ctx.editMessageText('Invalid notification mode.');
+      return;
+    }
+
+    this.sessionManager.setNotificationMode(userId, mode);
+    const session = this.sessionManager.getActiveSession(userId);
+    const emoji = session?.emoji || '';
+    await ctx.editMessageText(`Notification mode set to: *${mode}* ${emoji}`, {
+      parse_mode: 'Markdown',
+    });
+  }
+
+  /**
+   * Determine if a notification should be silenced based on session settings
+   */
+  private shouldSilenceNotification(
+    session: UserSession | undefined,
+    actionType: TelegramAction['type']
+  ): boolean {
+    const mode = session?.notificationMode ?? 'default';
+    if (mode === 'full') return false;
+    if (mode === 'silent') return true;
+    // default: only notification type (completion) is loud
+    return actionType !== 'notification';
   }
 
   /**
@@ -1393,19 +1506,22 @@ Everything else you type is sent to Claude as a prompt.
 
     formatter.on('action', async (action) => {
       try {
+        const shouldSilence = this.shouldSilenceNotification(session, action.type);
+
         if (action.type === 'message') {
           // Send or update message
           if (action.options && action.options.length > 0) {
             await ctx.reply(action.text, {
               reply_markup: buildOptionKeyboard(action.options),
+              disable_notification: shouldSilence,
             });
           } else if (action.text !== lastMessageText) {
-            await ctx.reply(action.text);
+            await ctx.reply(action.text, { disable_notification: shouldSilence });
             lastMessageText = action.text;
           }
         } else if (action.type === 'status') {
           // Send status message
-          const statusMsg = await ctx.reply(action.text);
+          const statusMsg = await ctx.reply(action.text, { disable_notification: shouldSilence });
           statusMessageId = statusMsg.message_id;
           // Update current tool in activeQueries for /querystatus
           const query = this.activeQueries.get(session!.id);
@@ -1426,13 +1542,14 @@ Everything else you type is sent to Claude as a prompt.
             query.currentTool = null;
           }
         } else if (action.type === 'notification') {
-          await ctx.reply(action.text);
+          // Notification (completion indicator) - uses shouldSilence which checks for 'notification' type
+          await ctx.reply(action.text, { disable_notification: shouldSilence });
         } else if (action.type === 'document') {
           // Send content as a downloadable file
           try {
             await ctx.replyWithDocument(
               new InputFile(Buffer.from(action.content, 'utf-8'), action.fileName),
-              { caption: action.caption }
+              { caption: action.caption, disable_notification: shouldSilence }
             );
 
             // If this is a plan file and we're in plan mode, show approval buttons
@@ -1440,6 +1557,7 @@ Everything else you type is sent to Claude as a prompt.
               await ctx.reply('📋 *Plan ready for review*\n\nWhat would you like to do?', {
                 parse_mode: 'Markdown',
                 reply_markup: buildPlanApprovalKeyboard(),
+                disable_notification: shouldSilence,
               });
             }
           } catch (docError) {
@@ -1447,7 +1565,8 @@ Everything else you type is sent to Claude as a prompt.
             // Fallback to sending as text (truncated if needed)
             const preview = action.content.slice(0, 3500);
             await ctx.reply(
-              `📋 ${action.fileName}:\n\n${preview}${action.content.length > 3500 ? '\n\n...(truncated)' : ''}`
+              `📋 ${action.fileName}:\n\n${preview}${action.content.length > 3500 ? '\n\n...(truncated)' : ''}`,
+              { disable_notification: shouldSilence }
             );
           }
         } else if (action.type === 'user_question') {
@@ -1464,8 +1583,8 @@ Everything else you type is sent to Claude as a prompt.
           });
           this.activeQuestionSets.set(userId, action.questions);
 
-          // Display only the first question
-          await this.displayQuestion(ctx, action.questions[0], 0, action.questions.length);
+          // Display only the first question (with notification silencing)
+          await this.displayQuestion(ctx, action.questions[0], 0, action.questions.length, session);
         }
       } catch (error) {
         logger.error('Error handling action:', error);
@@ -1483,7 +1602,10 @@ Everything else you type is sent to Claude as a prompt.
       logger.error('Claude error:', errorText);
       // Only send error if it's significant
       if (errorText.includes('Error') || errorText.includes('error')) {
-        await ctx.reply(`⚠️ ${errorText.slice(0, 200)} ${session!.emoji}`);
+        const shouldSilence = this.shouldSilenceNotification(session, 'status');
+        await ctx.reply(`⚠️ ${errorText.slice(0, 200)} ${session!.emoji}`, {
+          disable_notification: shouldSilence,
+        });
       }
     });
 
@@ -1493,6 +1615,7 @@ Everything else you type is sent to Claude as a prompt.
       statusUpdateCount++;
       const tool = formatter.getCurrentTool();
       const minutes = statusUpdateCount; // 1 update per minute
+      const shouldSilence = this.shouldSilenceNotification(session, 'status');
 
       try {
         if (tool) {
@@ -1500,7 +1623,9 @@ Everything else you type is sent to Claude as a prompt.
           await ctx.replyWithChatAction('typing');
         } else if (minutes % 2 === 0) {
           // Every 2 minutes if no tool activity, send a text message
-          await ctx.reply(`⏳ Claude is still working... (${minutes} min) ${session!.emoji}`);
+          await ctx.reply(`⏳ Claude is still working... (${minutes} min) ${session!.emoji}`, {
+            disable_notification: shouldSilence,
+          });
         } else {
           // Odd minutes, just show typing indicator
           await ctx.replyWithChatAction('typing');
@@ -1526,7 +1651,9 @@ Everything else you type is sent to Claude as a prompt.
             const textWithEmoji = text.endsWith(currentSession.emoji)
               ? text
               : `${text} ${currentSession.emoji}`;
-            await ctx.reply(textWithEmoji);
+            // Final buffer is treated as a message (not notification)
+            const shouldSilence = this.shouldSilenceNotification(currentSession, 'message');
+            await ctx.reply(textWithEmoji, { disable_notification: shouldSilence });
           } catch (error) {
             logger.error('Error sending final buffer:', error);
           }
@@ -1575,8 +1702,10 @@ Everything else you type is sent to Claude as a prompt.
       } catch (error) {
         const elapsed = ((Date.now() - queryStartTime) / 1000).toFixed(1);
         logger.error(`[user:${userId}] Query failed after ${elapsed}s:`, error);
+        const shouldSilence = this.shouldSilenceNotification(currentSession, 'status');
         await ctx.reply(
-          `❌ Error: ${error instanceof Error ? error.message : 'Unknown error'} ${currentSession.emoji}`
+          `❌ Error: ${error instanceof Error ? error.message : 'Unknown error'} ${currentSession.emoji}`,
+          { disable_notification: shouldSilence }
         );
       } finally {
         clearInterval(statusInterval);
@@ -1637,7 +1766,7 @@ Everything else you type is sent to Claude as a prompt.
 
       // Truncate if too long for Telegram (4000 char limit)
       if (output.length > 3900) {
-        output = output.slice(0, 3900) + '\n...(truncated)';
+        output = `${output.slice(0, 3900)}\n...(truncated)`;
       }
 
       const prefix = exitCode === 0 ? '✓' : `✗ (exit ${exitCode})`;
@@ -1673,6 +1802,7 @@ Everything else you type is sent to Claude as a prompt.
         { command: 'querystatus', description: 'Show active query status' },
         { command: 'mode', description: 'Show or change permission mode' },
         { command: 'verbosity', description: 'Control output detail level' },
+        { command: 'notifications', description: 'Control message notification sounds' },
         { command: 'settings', description: 'Manage default mode/directory' },
         { command: 'bothelp', description: 'Show help message' },
       ]);

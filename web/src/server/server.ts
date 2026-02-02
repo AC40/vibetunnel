@@ -12,7 +12,11 @@ import * as path from 'path';
 import { v4 as uuidv4 } from 'uuid';
 import { WebSocketServer } from 'ws';
 import { ServerEventType } from '../shared/types.js';
+import { SessionManager as TelegramSessionManager } from '../telegram/session-manager.js';
+import { TelegramBotService } from '../telegram/telegram-bot-service.js';
 import { apiSocketServer } from './api-socket-server.js';
+import { createClaudeSessionRoutes } from './claude/claude-session-api.js';
+import { ConversationStore } from './claude/conversation-store.js';
 import type { AuthenticatedRequest } from './middleware/auth.js';
 import { createAuthMiddleware } from './middleware/auth.js';
 import { PtyManager } from './pty/index.js';
@@ -49,10 +53,6 @@ import { closeLogger, createLogger, initLogger, setDebugMode } from './utils/log
 import { VapidManager } from './utils/vapid-manager.js';
 import { getVersionInfo, printVersionBanner } from './version.js';
 import { controlUnixHandler } from './websocket/control-unix-handler.js';
-import { ConversationStore } from './claude/conversation-store.js';
-import { createClaudeSessionRoutes } from './claude/claude-session-api.js';
-import { TelegramBotService } from '../telegram/telegram-bot-service.js';
-import { SessionManager as TelegramSessionManager } from '../telegram/session-manager.js';
 
 // Extended WebSocket request with authentication and routing info
 interface WebSocketRequest extends http.IncomingMessage {

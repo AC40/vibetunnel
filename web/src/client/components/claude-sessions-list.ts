@@ -6,8 +6,8 @@
 
 import { css, html, LitElement } from 'lit';
 import { customElement, property, state } from 'lit/decorators.js';
-import { createLogger } from '../utils/logger.js';
 import { authClient } from '../services/auth-client.js';
+import { createLogger } from '../utils/logger.js';
 
 const logger = createLogger('claude-sessions-list');
 

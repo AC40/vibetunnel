@@ -63,10 +63,32 @@ export class ClaudeSDKBridge extends EventEmitter {
 
     let capturedSessionId = params.sessionId || '';
     let isError = false;
+    let stdoutClosed = false;
+    let processClosed = false;
+    let processExitCode: number | null = null;
+
+    // Track when both stdout and process are done
+    const checkComplete = () => {
+      if (stdoutClosed && processClosed) {
+        const elapsed = ((Date.now() - queryStartTime) / 1000).toFixed(1);
+        logger.log(
+          `Both stdout and process closed, session=${capturedSessionId || 'none'}, elapsed=${elapsed}s`
+        );
+
+        // Clean up stdin if still open
+        if (this.process?.stdin && !this.process.stdin.destroyed) {
+          this.process.stdin.end();
+        }
+
+        this.emit('exit', processExitCode);
+        this.process = null;
+      }
+    };
 
     // Parse newline-delimited JSON from stdout
     if (this.process.stdout) {
       const rl = createInterface({ input: this.process.stdout });
+
       rl.on('line', (line) => {
         logger.debug(`[stdout] ${line.slice(0, 200)}`);
         try {
@@ -108,6 +130,17 @@ export class ClaudeSDKBridge extends EventEmitter {
           logger.debug(`[non-json] ${line.slice(0, 100)}`);
         }
       });
+
+      // Wait for readline to close before resolving - fixes race condition
+      // where process exits before all stdout is processed
+      rl.on('close', () => {
+        logger.log('Readline interface closed (stdout fully processed)');
+        stdoutClosed = true;
+        checkComplete();
+      });
+    } else {
+      // No stdout, mark as closed immediately
+      stdoutClosed = true;
     }
 
     // Capture stderr for error messages and handle permission prompts
@@ -134,30 +167,25 @@ export class ClaudeSDKBridge extends EventEmitter {
       }
 
       this.process.on('close', (code) => {
-        const elapsed = ((Date.now() - queryStartTime) / 1000).toFixed(1);
-        logger.log(
-          `Claude process exited, code=${code}, session=${capturedSessionId || 'none'}, elapsed=${elapsed}s`
-        );
-
-        // Clean up stdin if still open
-        if (this.process?.stdin && !this.process.stdin.destroyed) {
-          this.process.stdin.end();
-        }
-
-        this.emit('exit', code);
-        this.process = null;
-
-        if (code === 0 || capturedSessionId) {
-          resolve({ sessionId: capturedSessionId, isError });
-        } else {
-          reject(new Error(`Claude exited with code ${code}`));
-        }
+        logger.log(`Claude process exited with code=${code}, waiting for stdout to finish...`);
+        processExitCode = code;
+        processClosed = true;
+        checkComplete();
       });
 
       this.process.on('error', (error) => {
         logger.error(`Claude process error: ${error.message}`);
         this.process = null;
         reject(error);
+      });
+
+      // Listen for exit event (emitted after both stdout and process close)
+      this.once('exit', (code) => {
+        if (code === 0 || capturedSessionId) {
+          resolve({ sessionId: capturedSessionId, isError });
+        } else {
+          reject(new Error(`Claude exited with code ${code}`));
+        }
       });
     });
   }

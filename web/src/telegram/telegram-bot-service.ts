@@ -43,6 +43,7 @@ import {
   VALID_PERMISSION_MODES,
   VALID_VERBOSITY_LEVELS,
 } from './types.js';
+import { VoiceTranscriber } from './voice-transcriber.js';
 import { VoiceTranscriptionService } from './voice-transcription.js';
 
 // Debug mode: set TELEGRAM_DEBUG=true or TELEGRAM_DEBUG=1 for verbose logging
@@ -90,11 +91,13 @@ interface DirectoryPickerState {
 
 export class TelegramBotService {
   private bot: Bot;
+  private botToken: string;
   private sessionManager: SessionManager;
   private conversationStore?: ConversationStore;
   private allowedUsers: Set<number>;
   private allowUnsafeMode: boolean;
   private defaultWorkingDir: string;
+  private voiceTranscriber: VoiceTranscriber;
   private voiceTranscriptionService?: VoiceTranscriptionService;
 
   // Per-session bridges and formatters (keyed by session.id)
@@ -139,6 +142,7 @@ export class TelegramBotService {
     'verbosity',
     'notifications',
     'settings',
+    'clear',
     '1',
     '2',
     '3',
@@ -154,6 +158,7 @@ export class TelegramBotService {
 
   constructor(config: TelegramBotServiceConfig) {
     this.bot = new Bot(config.botToken);
+    this.botToken = config.botToken;
     this.defaultWorkingDir = config.defaultWorkingDir ?? process.cwd();
     this.sessionManager = new SessionManager(config.controlDir, {
       maxSessions: config.maxSessionsPerUser,
@@ -162,6 +167,7 @@ export class TelegramBotService {
     this.conversationStore = config.conversationStore;
     this.allowedUsers = new Set(config.allowedUsers || []);
     this.allowUnsafeMode = config.allowUnsafeMode ?? false;
+    this.voiceTranscriber = new VoiceTranscriber();
 
     // Initialize voice transcription if DeepGram API key is provided
     if (config.deepgramApiKey) {
@@ -213,6 +219,7 @@ export class TelegramBotService {
     this.bot.command('verbosity', (ctx) => this.handleVerbosity(ctx));
     this.bot.command('notifications', (ctx) => this.handleNotifications(ctx));
     this.bot.command('settings', (ctx) => this.handleSettings(ctx));
+    this.bot.command('clear', (ctx) => this.handleClear(ctx));
 
     // Quick response commands
     for (const num of ['1', '2', '3', '4', '5', '6', '7', '8', '9']) {
@@ -224,8 +231,9 @@ export class TelegramBotService {
     // Callback query handler for inline keyboards
     this.bot.on('callback_query:data', (ctx) => this.handleCallbackQuery(ctx));
 
-    // Voice message handler
+    // Voice message handlers
     this.bot.on('message:voice', (ctx) => this.handleVoiceMessage(ctx));
+    this.bot.on('message:audio', (ctx) => this.handleVoiceMessage(ctx));
 
     // General message handler
     this.bot.on('message:text', (ctx) => this.handleMessage(ctx));
@@ -310,6 +318,7 @@ Type /bothelp for all commands.
 /cd [path] - Change working directory
 /delete <name> - Delete a session
 /rename <name> - Rename current session
+/clear - Clear conversation history
 /mode [mode] - Show or change permission mode
 /unsafe - Toggle dangerously-skip-permissions mode
 /verbosity [level] - Control output detail
@@ -872,6 +881,30 @@ Everything else you type is sent to Claude as a prompt.
   }
 
   /**
+   * Handle /clear command - clear conversation history for active session
+   */
+  private async handleClear(ctx: Context): Promise<void> {
+    const userId = ctx.from?.id;
+    if (!userId || !this.isAuthorized(userId)) {
+      await ctx.reply('Not authorized');
+      return;
+    }
+
+    const result = this.sessionManager.clearSessionHistory(userId);
+
+    if ('error' in result) {
+      await ctx.reply(`❌ ${result.error}`);
+      return;
+    }
+
+    await ctx.reply(
+      `🧹 Cleared conversation history for session *${result.sessionName}* ${result.emoji}\n\n` +
+        `Next message will start a fresh conversation.`,
+      { parse_mode: 'Markdown' }
+    );
+  }
+
+  /**
    * Handle /settings command - manage user-level preferences
    */
   private async handleSettings(ctx: Context): Promise<void> {
@@ -1252,11 +1285,13 @@ Everything else you type is sent to Claude as a prompt.
     if (progress.currentIndex < progress.questions.length) {
       // Display next question
       const nextQuestion = progress.questions[progress.currentIndex];
+      const session = this.sessionManager.getActiveSession(userId);
       await this.displayQuestion(
         ctx,
         nextQuestion,
         progress.currentIndex,
-        progress.questions.length
+        progress.questions.length,
+        session
       );
     } else {
       // All questions answered - send all answers to Claude
@@ -1273,16 +1308,29 @@ Everything else you type is sent to Claude as a prompt.
   }
 
   /**
-   * Format collected answers as JSON for Claude
+   * Format collected answers as natural language for Claude
+   *
+   * NOTE: Due to Claude CLI limitations (github.com/anthropics/claude-code/issues/16712),
+   * we cannot send tool_result responses when resuming sessions. Instead, we format
+   * answers as natural language that Claude semantically understands as responses
+   * to its AskUserQuestion tool call.
    */
   private formatAnswersForClaude(questions: ClaudeQuestion[], answers: string[]): string {
-    // Format as JSON object mapping headers to answers
-    const answerObj: Record<string, string> = {};
+    const lines: string[] = [];
+    lines.push('Here are my answers to your questions:');
+    lines.push('');
+
     for (let i = 0; i < questions.length; i++) {
-      const key = questions[i].header || `question_${i + 1}`;
-      answerObj[key] = answers[i];
+      const q = questions[i];
+      const a = answers[i];
+      lines.push(`Q: ${q.question}`);
+      lines.push(`A: ${a}`);
+      if (i < questions.length - 1) lines.push('');
     }
-    return JSON.stringify(answerObj);
+
+    lines.push('');
+    lines.push('Please continue with my selections.');
+    return lines.join('\n');
   }
 
   /**
@@ -1388,6 +1436,91 @@ Everything else you type is sent to Claude as a prompt.
   }
 
   /**
+   * Handle voice messages (Telegram voice notes and audio files)
+   * Transcribes using Deepgram API and forwards to Claude
+   */
+  private async handleVoiceMessage(ctx: Context): Promise<void> {
+    const userId = ctx.from?.id;
+    if (!userId) return;
+
+    if (!this.isAuthorized(userId)) {
+      await ctx.reply('You are not authorized. Send /start to request access.');
+      return;
+    }
+
+    // Check if transcriber is configured
+    if (!this.voiceTranscriber.isConfigured()) {
+      await ctx.reply(
+        '🎤 Voice messages require DEEPGRAM_API_KEY to be configured.\n\n' +
+          'Set the environment variable and restart the server.'
+      );
+      return;
+    }
+
+    const session = this.sessionManager.getActiveSession(userId);
+    const emoji = session?.emoji || '';
+
+    try {
+      // Get file info from voice or audio message
+      const voice = ctx.message?.voice;
+      const audio = ctx.message?.audio;
+      const fileId = voice?.file_id || audio?.file_id;
+
+      if (!fileId) {
+        await ctx.reply(`❌ Could not process voice message ${emoji}`);
+        return;
+      }
+
+      // Show typing indicator while processing
+      await ctx.replyWithChatAction('typing');
+
+      // Get file path from Telegram
+      const file = await ctx.api.getFile(fileId);
+      if (!file.file_path) {
+        await ctx.reply(`❌ Could not download voice message ${emoji}`);
+        return;
+      }
+
+      // Download the file
+      const fileUrl = `https://api.telegram.org/file/bot${this.botToken}/${file.file_path}`;
+      const response = await fetch(fileUrl);
+
+      if (!response.ok) {
+        await ctx.reply(`❌ Failed to download voice message ${emoji}`);
+        return;
+      }
+
+      const buffer = Buffer.from(await response.arrayBuffer());
+
+      // Determine MIME type (Telegram voice messages are OGG/Opus)
+      const mimeType = voice ? 'audio/ogg' : audio?.mime_type || 'audio/ogg';
+
+      // Transcribe
+      const result = await this.voiceTranscriber.transcribe(buffer, mimeType);
+
+      if (result.error) {
+        await ctx.reply(`❌ ${result.error} ${emoji}`);
+        return;
+      }
+
+      if (!result.text) {
+        await ctx.reply(`❌ Could not transcribe voice message (no speech detected) ${emoji}`);
+        return;
+      }
+
+      // Show transcription to user
+      await ctx.reply(`🎤 Transcribed: "${result.text}" ${emoji}`);
+
+      // Forward to Claude
+      await this.forwardToClaude(ctx, result.text);
+    } catch (error) {
+      logger.error('Error handling voice message:', error);
+      const message = error instanceof Error ? error.message : 'Unknown error';
+      await ctx.reply(`❌ Error processing voice message: ${message} ${emoji}`);
+    }
+  }
+
+  /**
    * Handle general text messages
    */
   private async handleMessage(ctx: Context): Promise<void> {
@@ -1446,87 +1579,6 @@ Everything else you type is sent to Claude as a prompt.
     logger.log('[handleMessage] Forwarding to Claude...');
     await this.forwardToClaude(ctx, text);
     logger.log('[handleMessage] Done forwarding to Claude');
-  }
-
-  /**
-   * Handle incoming voice messages
-   * Transcribes the audio using DeepGram and forwards the text to Claude
-   */
-  private async handleVoiceMessage(ctx: Context): Promise<void> {
-    const userId = ctx.from?.id;
-    const voice = ctx.message?.voice;
-    logger.log(`[handleVoiceMessage] userId=${userId}, voice duration=${voice?.duration}s`);
-
-    if (!userId || !voice) {
-      logger.log('[handleVoiceMessage] No userId or voice, returning');
-      return;
-    }
-
-    if (!this.isAuthorized(userId)) {
-      logger.log('[handleVoiceMessage] User not authorized');
-      await ctx.reply('You are not authorized. Send /start to request access.');
-      return;
-    }
-
-    // Check if voice transcription is configured
-    if (!this.voiceTranscriptionService?.isConfigured()) {
-      await ctx.reply(
-        '🎤 Voice messages are not supported.\n\n' +
-          'Voice transcription requires a DeepGram API key to be configured.'
-      );
-      return;
-    }
-
-    // Show typing indicator while processing
-    await ctx.replyWithChatAction('typing');
-
-    try {
-      // Get the file from Telegram
-      const file = await ctx.api.getFile(voice.file_id);
-      const fileUrl = `https://api.telegram.org/file/bot${this.bot.token}/${file.file_path}`;
-
-      logger.log(`[handleVoiceMessage] Transcribing voice file: ${file.file_path}`);
-
-      // Send a status message
-      const statusMsg = await ctx.reply('🎤 Transcribing voice message...');
-
-      // Transcribe the audio
-      const result = await this.voiceTranscriptionService.transcribeFromUrl(fileUrl);
-
-      // Delete the status message
-      try {
-        if (ctx.chat?.id) {
-          await ctx.api.deleteMessage(ctx.chat.id, statusMsg.message_id);
-        }
-      } catch (_e) {
-        // Ignore if already deleted
-      }
-
-      if (!result.text || result.text.trim() === '') {
-        await ctx.reply(
-          '🎤 Could not transcribe the voice message. Please try again or send text.'
-        );
-        return;
-      }
-
-      // Show the transcription to the user
-      const session = this.sessionManager.getActiveSession(userId);
-      const emoji = session?.emoji ?? '';
-      const durationText = result.duration ? ` (${result.duration.toFixed(1)}s)` : '';
-      await ctx.reply(`🎤 *Transcribed${durationText}:*\n\n${result.text} ${emoji}`, {
-        parse_mode: 'Markdown',
-      });
-
-      logger.log(`[handleVoiceMessage] Transcription: "${result.text.slice(0, 100)}..."`);
-
-      // Forward the transcribed text to Claude
-      await this.forwardToClaude(ctx, result.text);
-    } catch (error) {
-      logger.error('[handleVoiceMessage] Error:', error);
-      await ctx.reply(
-        `❌ Failed to transcribe voice message: ${error instanceof Error ? error.message : 'Unknown error'}`
-      );
-    }
   }
 
   /**
@@ -1712,30 +1764,28 @@ Everything else you type is sent to Claude as a prompt.
     });
 
     // Send periodic "still working" updates so user knows Claude is active
+    // Fires every 15 minutes to reduce notification spam
     let statusUpdateCount = 0;
     const statusInterval = setInterval(async () => {
       statusUpdateCount++;
       const tool = formatter.getCurrentTool();
-      const minutes = statusUpdateCount; // 1 update per minute
+      const minutes = statusUpdateCount * 15; // 15 min per interval
       const shouldSilence = this.shouldSilenceNotification(session, 'status');
 
       try {
         if (tool) {
           // If using a tool, just show typing indicator
           await ctx.replyWithChatAction('typing');
-        } else if (minutes % 2 === 0) {
-          // Every 2 minutes if no tool activity, send a text message
+        } else {
+          // Send a text message so user knows Claude is still working
           await ctx.reply(`⏳ Claude is still working... (${minutes} min) ${session!.emoji}`, {
             disable_notification: shouldSilence,
           });
-        } else {
-          // Odd minutes, just show typing indicator
-          await ctx.replyWithChatAction('typing');
         }
       } catch (error) {
         logger.error('Error sending status update:', error);
       }
-    }, 60_000); // Every minute
+    }, 900_000); // Every 15 minutes
 
     // Capture session for closure
     const currentSession = session;
@@ -1899,6 +1949,7 @@ Everything else you type is sent to Claude as a prompt.
         { command: 'cd', description: 'Change working directory' },
         { command: 'delete', description: 'Delete a session' },
         { command: 'rename', description: 'Rename current session' },
+        { command: 'clear', description: 'Clear conversation history' },
         { command: 'cancel', description: 'Interrupt running operation' },
         { command: 'status', description: 'Show session status' },
         { command: 'querystatus', description: 'Show active query status' },

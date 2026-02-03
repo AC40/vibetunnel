@@ -6,10 +6,11 @@
 
 export { ClaudeSDKBridge } from './claude-sdk-bridge.js';
 export { buildConfirmKeyboard, buildOptionKeyboard } from './keyboards.js';
-export { detectInteractiveOptions } from './option-detector.js';
 export { OutputFormatter } from './output-formatter.js';
 export { SessionManager } from './session-manager.js';
 export { TelegramBotService } from './telegram-bot-service.js';
+export { VoiceTranscriber } from './voice-transcriber.js';
+
 // Re-export types
 export type {
   ClaudeQueryParams,

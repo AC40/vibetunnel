@@ -356,6 +356,37 @@ export class SessionManager {
   }
 
   /**
+   * Clear the conversation history for a session by resetting the Claude session ID.
+   * This causes the next Claude query to start a fresh conversation.
+   * All other session settings (working dir, mode, etc.) are preserved.
+   */
+  clearSessionHistory(
+    userId: number,
+    sessionId?: string
+  ): { success: boolean; sessionName: string; emoji: string } | { success: false; error: string } {
+    const profile = this.profiles.get(userId);
+    if (!profile) {
+      return { success: false, error: 'No sessions found.' };
+    }
+
+    // Use specified session or active session
+    const session = sessionId
+      ? profile.sessions.find((s) => s.id === sessionId)
+      : this.getActiveSession(userId);
+
+    if (!session) {
+      return { success: false, error: 'Session not found.' };
+    }
+
+    // Reset Claude session ID - next query will start fresh
+    session.claudeSessionId = '';
+    session.lastActivity = new Date();
+    this.saveToDisk();
+
+    return { success: true, sessionName: session.name, emoji: session.emoji };
+  }
+
+  /**
    * Get user settings
    */
   getUserSettings(userId: number): UserSettings {

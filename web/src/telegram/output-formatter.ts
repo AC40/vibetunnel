@@ -7,14 +7,7 @@
 
 import chalk from 'chalk';
 import { EventEmitter } from 'events';
-import { detectInteractiveOptions } from './option-detector.js';
-import type {
-  ClaudeQuestion,
-  InteractiveOption,
-  SDKEvent,
-  TelegramAction,
-  VerbosityLevel,
-} from './types.js';
+import type { ClaudeQuestion, SDKEvent, TelegramAction, VerbosityLevel } from './types.js';
 
 // Debug mode: set TELEGRAM_DEBUG=true or TELEGRAM_DEBUG=1 for verbose logging
 const isDebug = process.env.TELEGRAM_DEBUG === 'true' || process.env.TELEGRAM_DEBUG === '1';
@@ -40,7 +33,6 @@ export class OutputFormatter extends EventEmitter {
   private textBuffer = '';
   private currentTool: string | null = null;
   private toolInputBuffer = ''; // Accumulate tool input JSON
-  private lastTextBlockStart = 0; // Track where last text block started
   private batchTimeout: NodeJS.Timeout | null = null;
   private verbosity: VerbosityLevel = 'normal';
   private sessionEmoji: string | null = null; // Session emoji to append to messages
@@ -97,9 +89,6 @@ export class OutputFormatter extends EventEmitter {
           if (this.verbosity !== 'minimal') {
             action = { type: 'status', text: `🔧 Using ${this.currentTool}...` };
           }
-        } else if (e.content_block.type === 'text') {
-          // Track where this text block starts for option detection
-          this.lastTextBlockStart = this.textBuffer.length;
         }
       } else if (e.type === 'content_block_delta') {
         if (e.delta.type === 'text_delta') {
@@ -258,16 +247,9 @@ export class OutputFormatter extends EventEmitter {
       text = `${text} ${this.sessionEmoji}`;
     }
 
-    // Only detect options in the LAST text block to avoid merging multiple option groups
-    const textToScanForOptions = this.textBuffer.slice(this.lastTextBlockStart);
-    const options = detectInteractiveOptions(textToScanForOptions);
-
-    logger.log(
-      `Flushing buffer: ${text.length} chars${options ? `, ${options.length} options` : ''}`
-    );
-    this.emit('action', { type: 'message', text, options: options || undefined });
+    logger.log(`Flushing buffer: ${text.length} chars`);
+    this.emit('action', { type: 'message', text });
     this.textBuffer = '';
-    this.lastTextBlockStart = 0; // Reset for next message
   }
 
   /**
@@ -285,13 +267,6 @@ export class OutputFormatter extends EventEmitter {
     }
 
     return cleaned;
-  }
-
-  /**
-   * Get detected options from the current buffer
-   */
-  getBufferedOptions(): InteractiveOption[] | null {
-    return detectInteractiveOptions(this.textBuffer);
   }
 
   /**

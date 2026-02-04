@@ -55,8 +55,8 @@ export class ClaudeSDKBridge extends EventEmitter {
       stdio: ['pipe', 'pipe', 'pipe'],
     });
 
-    // Keep stdin open to respond to permission prompts (e.g., AskUserQuestion)
-    // stdin will be closed when the process exits
+    // Close stdin immediately to signal EOF - Claude CLI waits for this before processing
+    this.process.stdin?.end();
 
     const pid = this.process.pid;
     logger.log(`Claude process spawned, pid=${pid}`);
@@ -74,11 +74,6 @@ export class ClaudeSDKBridge extends EventEmitter {
         logger.log(
           `Both stdout and process closed, session=${capturedSessionId || 'none'}, elapsed=${elapsed}s`
         );
-
-        // Clean up stdin if still open
-        if (this.process?.stdin && !this.process.stdin.destroyed) {
-          this.process.stdin.end();
-        }
 
         this.emit('exit', processExitCode);
         this.process = null;
@@ -143,19 +138,10 @@ export class ClaudeSDKBridge extends EventEmitter {
       stdoutClosed = true;
     }
 
-    // Capture stderr for error messages and handle permission prompts
+    // Capture stderr for error messages
     if (this.process.stderr) {
       this.process.stderr.on('data', (data: Buffer) => {
         const errorText = data.toString();
-
-        // Auto-approve AskUserQuestion permission prompt
-        // Claude CLI asks "Answer questions?" when this tool is used
-        if (errorText.includes('Answer questions?') || errorText.includes('AskUserQuestion')) {
-          logger.log('Auto-approving AskUserQuestion permission prompt');
-          this.process?.stdin?.write('y\n');
-          return; // Don't emit this as an error
-        }
-
         this.emit('error', errorText);
       });
     }
@@ -225,14 +211,5 @@ export class ClaudeSDKBridge extends EventEmitter {
    */
   isRunning(): boolean {
     return this.process !== null && !this.process.killed;
-  }
-
-  /**
-   * Send input to the running Claude process (for interactive prompts)
-   */
-  sendInput(input: string): void {
-    if (this.process?.stdin) {
-      this.process.stdin.write(input);
-    }
   }
 }

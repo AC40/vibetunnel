@@ -36,6 +36,7 @@ export class OutputFormatter extends EventEmitter {
   private batchTimeout: NodeJS.Timeout | null = null;
   private verbosity: VerbosityLevel = 'normal';
   private sessionEmoji: string | null = null; // Session emoji to append to messages
+  private suppressTextUntilAnswer = false; // Suppress text after AskUserQuestion
 
   /**
    * Set verbosity level
@@ -92,8 +93,10 @@ export class OutputFormatter extends EventEmitter {
         }
       } else if (e.type === 'content_block_delta') {
         if (e.delta.type === 'text_delta') {
-          this.textBuffer += e.delta.text;
-          this.scheduleBatchSend();
+          if (!this.suppressTextUntilAnswer) {
+            this.textBuffer += e.delta.text;
+            this.scheduleBatchSend();
+          }
         } else if (e.delta.type === 'input_json_delta' && this.currentTool) {
           // Accumulate tool input JSON
           this.toolInputBuffer += e.delta.partial_json;
@@ -113,7 +116,9 @@ export class OutputFormatter extends EventEmitter {
       // Extract text content from assistant message
       for (const block of event.message.content) {
         if (block.type === 'text' && block.text) {
-          this.textBuffer += block.text;
+          if (!this.suppressTextUntilAnswer) {
+            this.textBuffer += block.text;
+          }
         } else if (block.type === 'tool_use' && block.name && block.input) {
           // Process tool_use blocks (e.g., AskUserQuestion)
           this.processToolInput(block.name, JSON.stringify(block.input));
@@ -163,6 +168,11 @@ export class OutputFormatter extends EventEmitter {
         if (input.questions && Array.isArray(input.questions)) {
           const questions = input.questions as ClaudeQuestion[];
           console.log(`[telegram] Emitting user_question with ${questions.length} question(s)`);
+
+          // Suppress any text that follows - Claude sends fallback text we don't want
+          this.suppressTextUntilAnswer = true;
+          this.clearBuffer(); // Clear any text buffered before the tool completed
+
           this.emit('action', {
             type: 'user_question',
             questions,
@@ -278,6 +288,13 @@ export class OutputFormatter extends EventEmitter {
       clearTimeout(this.batchTimeout);
       this.batchTimeout = null;
     }
+  }
+
+  /**
+   * Reset text suppression (call after user answers question)
+   */
+  resetSuppression(): void {
+    this.suppressTextUntilAnswer = false;
   }
 
   /**

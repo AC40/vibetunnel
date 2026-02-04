@@ -1302,6 +1302,13 @@ Everything else you type is sent to Claude as a prompt.
       this.activeQuestionSets.delete(userId);
       this.pendingQuestionAnswer.delete(userId);
 
+      // Reset text suppression on the formatter before sending new message
+      const session = this.sessionManager.getActiveSession(userId);
+      if (session) {
+        const formatter = this.activeFormatters.get(session.id);
+        formatter?.resetSuppression();
+      }
+
       // Forward all answers to Claude
       await this.forwardToClaude(ctx, formattedAnswers);
     }

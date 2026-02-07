@@ -2,7 +2,7 @@
  * Output Formatter
  *
  * Formats Claude SDK JSON events into Telegram messages.
- * Handles batching and truncation for Telegram's message limits.
+ * Handles batching of Claude output; Telegram chunking is handled downstream.
  */
 
 import chalk from 'chalk';
@@ -22,7 +22,6 @@ const createLogger = (name: string) => ({
 
 const logger = createLogger('output-formatter');
 
-const TELEGRAM_MAX_LENGTH = 4000; // Telegram limit is 4096, leave some margin
 const BATCH_DELAY_MS = 500;
 
 export interface OutputFormatterEvents {
@@ -252,6 +251,11 @@ export class OutputFormatter extends EventEmitter {
 
     let text = this.formatForTelegram(this.textBuffer);
 
+    if (!text) {
+      this.textBuffer = '';
+      return;
+    }
+
     // Append session emoji if set
     if (this.sessionEmoji) {
       text = `${text} ${this.sessionEmoji}`;
@@ -264,18 +268,11 @@ export class OutputFormatter extends EventEmitter {
 
   /**
    * Format text for Telegram
-   * - Truncate to max length
    * - Clean up any formatting issues
    */
   private formatForTelegram(text: string): string {
     // Clean up text
     let cleaned = text.trim();
-
-    // Truncate if too long
-    if (cleaned.length > TELEGRAM_MAX_LENGTH) {
-      cleaned = `...${cleaned.slice(-(TELEGRAM_MAX_LENGTH - 3))}`;
-    }
-
     return cleaned;
   }
 
@@ -326,6 +323,8 @@ export class OutputFormatter extends EventEmitter {
 
     const text = this.formatForTelegram(this.textBuffer);
     this.textBuffer = '';
+
+    if (!text) return null;
 
     logger.debug(`[formatter] Force flushed buffer, ${text.length} chars`);
     return text;

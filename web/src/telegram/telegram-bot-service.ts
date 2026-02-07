@@ -49,6 +49,10 @@ import { VoiceTranscriptionService } from './voice-transcription.js';
 // Debug mode: set TELEGRAM_DEBUG=true or TELEGRAM_DEBUG=1 for verbose logging
 const isDebug = process.env.TELEGRAM_DEBUG === 'true' || process.env.TELEGRAM_DEBUG === '1';
 const noop = () => {};
+const TELEGRAM_MAX_LENGTH = 4000; // Telegram limit is 4096, leave some margin
+const TELEGRAM_CHUNK_DELAY_MS = 200;
+
+type ReplyOptions = Parameters<Context['reply']>[1];
 
 const createLogger = (name: string) => ({
   log: isDebug ? (...args: unknown[]) => console.log(chalk.blue(`[${name}]`), ...args) : noop,
@@ -1672,12 +1676,12 @@ Everything else you type is sent to Claude as a prompt.
         if (action.type === 'message') {
           // Send or update message
           if (action.options && action.options.length > 0) {
-            await ctx.reply(action.text, {
+            await this.replyInChunks(ctx, action.text, {
               reply_markup: buildOptionKeyboard(action.options),
               disable_notification: shouldSilence,
             });
           } else if (action.text !== lastMessageText) {
-            await ctx.reply(action.text, { disable_notification: shouldSilence });
+            await this.replyInChunks(ctx, action.text, { disable_notification: shouldSilence });
             lastMessageText = action.text;
           }
         } else if (action.type === 'status') {
@@ -1802,22 +1806,22 @@ Everything else you type is sent to Claude as a prompt.
       clearInterval(statusInterval);
 
       // Flush any remaining buffered text
-      if (formatter.hasPendingContent()) {
-        const text = formatter.forceFlush();
-        if (text) {
-          try {
-            // Add emoji suffix if not already present
-            const textWithEmoji = text.endsWith(currentSession.emoji)
-              ? text
-              : `${text} ${currentSession.emoji}`;
-            // Final buffer is treated as a message (not notification)
-            const shouldSilence = this.shouldSilenceNotification(currentSession, 'message');
-            await ctx.reply(textWithEmoji, { disable_notification: shouldSilence });
-          } catch (error) {
-            logger.error('Error sending final buffer:', error);
+        if (formatter.hasPendingContent()) {
+          const text = formatter.forceFlush();
+          if (text) {
+            try {
+              // Add emoji suffix if not already present
+              const textWithEmoji = text.endsWith(currentSession.emoji)
+                ? text
+                : `${text} ${currentSession.emoji}`;
+              // Final buffer is treated as a message (not notification)
+              const shouldSilence = this.shouldSilenceNotification(currentSession, 'message');
+              await this.replyInChunks(ctx, textWithEmoji, { disable_notification: shouldSilence });
+            } catch (error) {
+              logger.error('Error sending final buffer:', error);
+            }
           }
         }
-      }
 
       logger.log(`[forwardToClaude] Claude exited with code ${code}`);
     });
@@ -1878,6 +1882,56 @@ Everything else you type is sent to Claude as a prompt.
     runQuery().catch((error) => {
       logger.error('Unexpected error in runQuery:', error);
     });
+  }
+
+  private splitForTelegram(text: string): string[] {
+    if (!text) return [];
+
+    const chars = Array.from(text);
+    if (chars.length <= TELEGRAM_MAX_LENGTH) {
+      return [text];
+    }
+
+    const chunks: string[] = [];
+    for (let i = 0; i < chars.length; i += TELEGRAM_MAX_LENGTH) {
+      const chunk = chars.slice(i, i + TELEGRAM_MAX_LENGTH).join('');
+      if (chunk.trim().length > 0) {
+        chunks.push(chunk);
+      }
+    }
+
+    return chunks;
+  }
+
+  private async replyInChunks(
+    ctx: Context,
+    text: string,
+    options?: ReplyOptions
+  ): Promise<void> {
+    const chunks = this.splitForTelegram(text);
+    if (chunks.length === 0) return;
+
+    const baseOptions = options ? { ...options } : undefined;
+
+    for (let i = 0; i < chunks.length; i++) {
+      const isLast = i === chunks.length - 1;
+      const chunkOptions = baseOptions
+        ? isLast
+          ? baseOptions
+          : { ...baseOptions, reply_markup: undefined }
+        : undefined;
+
+      await ctx.reply(chunks[i], chunkOptions);
+
+      if (!isLast && TELEGRAM_CHUNK_DELAY_MS > 0) {
+        await this.delay(TELEGRAM_CHUNK_DELAY_MS);
+      }
+    }
+  }
+
+  private async delay(ms: number): Promise<void> {
+    if (ms <= 0) return;
+    await new Promise((resolve) => setTimeout(resolve, ms));
   }
 
   /**
